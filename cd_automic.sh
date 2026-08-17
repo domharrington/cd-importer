@@ -19,7 +19,8 @@ NAVIDROME_ROOT="${NAVIDROME_ROOT:-$SCRIPT_DIR/navidrome_music}"
 POLL_INTERVAL="${POLL_INTERVAL:-5}"
 EJECT_WHEN_DONE="${EJECT_WHEN_DONE:-1}"
 FETCH_COVER_ART="${FETCH_COVER_ART:-1}"
-# 1 = let flac print its live per-track percentage; 0 = only our summary lines.
+# 1 = tick a live elapsed-time line while each track encodes (interactive only);
+# 0 = print nothing until the track's summary line.
 SHOW_ENCODE_PROGRESS="${SHOW_ENCODE_PROGRESS:-1}"
 USER_AGENT="cd-importer/1.0 ( hello@domharrington.email )"
 
@@ -299,20 +300,39 @@ for num, title, name in entries:
         [ -n "$date" ] && tags[${#tags[@]}]="--tag=DATE=$date"
         [ -n "$mbid" ] && tags[${#tags[@]}]="--tag=MUSICBRAINZ_ALBUMID=$mbid"
 
-        # With progress on, flac prints its own live percentage for the track.
-        # Suppressing it leaves only our per-track summary line.
-        [ "$SHOW_ENCODE_PROGRESS" = "1" ] || tags[${#tags[@]}]="--totally-silent"
-
         # --verify decodes as it encodes and fails loudly on a bad read, which
         # is the closest thing to rip verification available without cdparanoia.
+        # --totally-silent suppresses flac's banner and its per-file "skipping
+        # unknown chunk 'FVER'" notice, which are pure noise once per track; we
+        # detect failure from the exit status and report it ourselves.
         # </dev/null matters: flac reads stdin, and without this it would eat
         # the rest of the work list this loop is reading.
-        local track_start track_elapsed out_bytes
+        local flac_cmd
+        flac_cmd=(flac --best --verify --totally-silent --force
+                  "${tags[@]}" -o "$out_file" "$aiff_dir/$aiff_base")
+
+        local track_start track_elapsed out_bytes status
         track_start="$(date +%s)"
-        if flac --best --verify --force \
-                "${tags[@]}" \
-                -o "$out_file" \
-                "$aiff_dir/$aiff_base" </dev/null; then
+        if [ "$SHOW_ENCODE_PROGRESS" = "1" ] && [ -t 2 ]; then
+            # Encode in the background so we can tick a single, self-overwriting
+            # progress line. Only when stderr is a terminal — writing \r into a
+            # redirected log would just produce very long lines.
+            local pid
+            "${flac_cmd[@]}" </dev/null &
+            pid=$!
+            while kill -0 "$pid" 2>/dev/null; do
+                printf '\r      ⏳ %s' "$(fmt_elapsed $(( $(date +%s) - track_start )))" >&2
+                sleep 1
+            done
+            wait "$pid"
+            status=$?
+            printf '\r\033[K' >&2
+        else
+            "${flac_cmd[@]}" </dev/null
+            status=$?
+        fi
+
+        if [ "$status" -eq 0 ]; then
             track_elapsed=$(( $(date +%s) - track_start ))
             out_bytes="$(stat -f%z "$out_file" 2>/dev/null || echo 0)"
             audio_done=$((audio_done + track_audio))
