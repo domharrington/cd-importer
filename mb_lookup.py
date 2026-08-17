@@ -123,19 +123,53 @@ def toc_param(first_track, last_track, leadout, offsets):
 
 _last_request = [0.0]
 
+# MusicBrainz returns these when it is busy or rate-limiting, not when the disc
+# is unknown. Retrying is the correct response — falling through to a fuzzier
+# lookup strategy would silently downgrade an otherwise exact match.
+RETRY_STATUS = {429, 500, 502, 503, 504}
+MAX_ATTEMPTS = 4
+
 
 def ws_get(path, params):
-    """GET a MusicBrainz JSON endpoint, respecting the 1 req/sec rate limit."""
-    wait = 1.1 - (time.monotonic() - _last_request[0])
-    if wait > 0:
-        time.sleep(wait)
-    _last_request[0] = time.monotonic()
-
+    """GET a MusicBrainz JSON endpoint, respecting the 1 req/sec rate limit and
+    retrying transient server errors with backoff."""
     params = dict(params, fmt="json")
     url = f"{WS}/{path}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.load(resp)
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        wait = 1.1 - (time.monotonic() - _last_request[0])
+        if wait > 0:
+            time.sleep(wait)
+        _last_request[0] = time.monotonic()
+
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as err:
+            if err.code not in RETRY_STATUS or attempt == MAX_ATTEMPTS:
+                raise
+            # Honour Retry-After when the server sends one.
+            delay = attempt * 2
+            retry_after = err.headers.get("Retry-After") if err.headers else None
+            if retry_after and retry_after.isdigit():
+                delay = max(delay, min(int(retry_after), 30))
+            print(
+                f"  MusicBrainz returned {err.code}; retrying in {delay}s "
+                f"(attempt {attempt}/{MAX_ATTEMPTS})",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as err:
+            if attempt == MAX_ATTEMPTS:
+                raise
+            delay = attempt * 2
+            print(
+                f"  MusicBrainz request failed ({err}); retrying in {delay}s "
+                f"(attempt {attempt}/{MAX_ATTEMPTS})",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
 
 
 def credit_to_name(artist_credit):
@@ -151,13 +185,20 @@ def credit_to_name(artist_credit):
 
 
 def score_release(release, track_count):
-    """Rank candidate releases: official first, then earliest date."""
-    official = (release.get("status") or "") == "Official"
-    date = release.get("date") or "9999"
+    """Rank candidate releases: right track count, then artwork, then official,
+    then earliest date.
+
+    Artwork is a ranking factor because releases are otherwise interchangeable
+    for our purposes — same album, same tracks — but only some have a cover in
+    the Cover Art Archive, and picking one that does saves a pointless 404.
+    """
     matches = any(
         m.get("track-count") == track_count for m in release.get("media", [])
     )
-    return (not matches, not official, date)
+    has_art = bool((release.get("cover-art-archive") or {}).get("artwork"))
+    official = (release.get("status") or "") == "Official"
+    date = release.get("date") or "9999"
+    return (not matches, not has_art, not official, date)
 
 
 def medium_for_disc(release, discid, track_count):
@@ -209,6 +250,10 @@ def build_result(release, discid, track_count, source):
         "date": date,
         "year": date[:4],
         "mbid": release.get("id") or "",
+        # The release group is the art fallback: a specific pressing often has
+        # no cover of its own while the album as a whole does.
+        "release_group": (release.get("release-group") or {}).get("id", ""),
+        "has_artwork": bool((release.get("cover-art-archive") or {}).get("artwork")),
         "discid": discid or "",
         "disc_number": int(medium.get("position") or 1),
         "disc_total": len(release.get("media", [])) or 1,
@@ -228,7 +273,7 @@ def pick(releases, discid, track_count, source):
 
 def lookup_by_discid(discid, track_count):
     try:
-        data = ws_get(f"discid/{discid}", {"inc": "artist-credits+recordings"})
+        data = ws_get(f"discid/{discid}", {"inc": "artist-credits+recordings+release-groups"})
     except urllib.error.HTTPError as err:
         if err.code == 404:
             return None
@@ -241,13 +286,23 @@ def lookup_by_toc(toc, track_count):
     when this exact pressing has no disc ID attached yet."""
     try:
         data = ws_get(
-            "discid/-", {"toc": toc, "inc": "artist-credits+recordings", "cdstubs": "no"}
+            "discid/-", {"toc": toc, "inc": "artist-credits+recordings+release-groups", "cdstubs": "no"}
         )
     except urllib.error.HTTPError as err:
         if err.code == 404:
             return None
         raise
     return pick(data.get("releases", []), None, track_count, "toc")
+
+
+def release_group_for(release_mbid):
+    """Resolve a release MBID to its release-group MBID.
+
+    Used by the --art backfill path for albums ripped before the release group
+    was recorded in the tags.
+    """
+    data = ws_get(f"release/{release_mbid}", {"inc": "release-groups"})
+    return (data.get("release-group") or {}).get("id", "")
 
 
 def lookup_by_title(album_name, track_count):
@@ -262,7 +317,7 @@ def lookup_by_title(album_name, track_count):
     for candidate in data.get("releases", []):
         try:
             full = ws_get(
-                f"release/{candidate['id']}", {"inc": "artist-credits+recordings"}
+                f"release/{candidate['id']}", {"inc": "artist-credits+recordings+release-groups"}
             )
         except urllib.error.HTTPError:
             continue
@@ -285,7 +340,24 @@ def main():
         action="store_true",
         help="Print the computed disc ID and exit (no network access)",
     )
+    parser.add_argument(
+        "--release-group",
+        metavar="RELEASE_MBID",
+        help="Print the release-group MBID for a release MBID and exit",
+    )
     args = parser.parse_args()
+
+    if args.release_group:
+        try:
+            rgid = release_group_for(args.release_group)
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as err:
+            print(f"Could not resolve release group: {err}", file=sys.stderr)
+            return 1
+        if not rgid:
+            print("No release group found for that release", file=sys.stderr)
+            return 1
+        print(rgid)
+        return 0
 
     discid = args.discid
     toc = None

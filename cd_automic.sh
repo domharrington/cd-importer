@@ -118,20 +118,42 @@ for track in data.get("tracks", []):
 ' <<< "$1" 2>/dev/null
 }
 
-# Fetch front cover art from the Cover Art Archive into $1/cover.jpg.
+# Fetch front cover art into $3/cover.jpg, trying the exact release first and
+# then the release group. A specific pressing frequently has no cover of its
+# own while the album as a whole does, so the group is a genuine second chance
+# rather than a duplicate request.
 fetch_cover_art() {
-    local mbid="$1" dest_dir="$2" size
-    [ -n "$mbid" ] || return 1
+    local mbid="$1" rgid="$2" dest_dir="$3" kind id size url
     [ -f "$dest_dir/cover.jpg" ] && return 0
-    for size in front-1200 front-500 front; do
-        if curl -fsSL --max-time 30 -A "$USER_AGENT" \
-                "https://coverartarchive.org/release/$mbid/$size" \
-                -o "$dest_dir/cover.jpg" 2>/dev/null; then
-            [ -s "$dest_dir/cover.jpg" ] && return 0
-        fi
+    for kind in release:$mbid release-group:$rgid; do
+        id="${kind#*:}"
+        [ -n "$id" ] || continue
+        for size in front-1200 front-500 front; do
+            url="https://coverartarchive.org/${kind%%:*}/$id/$size"
+            # --retry covers the 5xx blips the Cover Art Archive throws when busy.
+            if curl -fsSL --max-time 30 --retry 3 --retry-delay 2 \
+                    --retry-all-errors -A "$USER_AGENT" \
+                    "$url" -o "$dest_dir/cover.jpg" 2>/dev/null \
+               && [ -s "$dest_dir/cover.jpg" ]; then
+                return 0
+            fi
+        done
     done
     rm -f "$dest_dir/cover.jpg"
     return 1
+}
+
+# Write cover.jpg into every FLAC in a folder as a front-cover PICTURE block.
+embed_cover_art() {
+    local dest_dir="$1" flac_file
+    [ -f "$dest_dir/cover.jpg" ] || return 1
+    for flac_file in "$dest_dir"/*.flac; do
+        [ -f "$flac_file" ] || continue
+        metaflac --remove --block-type=PICTURE --dont-use-padding \
+            "$flac_file" </dev/null 2>/dev/null
+        metaflac --import-picture-from="3||||$dest_dir/cover.jpg" \
+            "$flac_file" </dev/null 2>/dev/null
+    done
 }
 
 process_disc() {
@@ -155,7 +177,8 @@ process_disc() {
     mb_json="$(cat "$mb_out")"
     rm -f "$mb_out"
 
-    local artist album album_artist date year mbid disc_number disc_total
+    local artist album album_artist date year mbid release_group
+    local disc_number disc_total
     if [ -n "$mb_json" ]; then
         artist="$(mb_field artist "$mb_json")"
         album_artist="$(mb_field album_artist "$mb_json")"
@@ -163,6 +186,7 @@ process_disc() {
         date="$(mb_field date "$mb_json")"
         year="$(mb_field year "$mb_json")"
         mbid="$(mb_field mbid "$mb_json")"
+        release_group="$(mb_field release_group "$mb_json")"
         disc_number="$(mb_field disc_number "$mb_json")"
         disc_total="$(mb_field disc_total "$mb_json")"
         log "   ✅ $artist - $album ($year)"
@@ -171,7 +195,8 @@ process_disc() {
         artist="Unknown Artist"
         album_artist="Unknown Artist"
         album="$disc_name"
-        date=""; year=""; mbid=""; disc_number=1; disc_total=1
+        date=""; year=""; mbid=""; release_group=""
+        disc_number=1; disc_total=1
     fi
     [ -n "$album" ] || album="$disc_name"
     [ -n "$artist" ] || artist="Unknown Artist"
@@ -299,6 +324,9 @@ for num, title, name in entries:
         )
         [ -n "$date" ] && tags[${#tags[@]}]="--tag=DATE=$date"
         [ -n "$mbid" ] && tags[${#tags[@]}]="--tag=MUSICBRAINZ_ALBUMID=$mbid"
+        # Recorded so --art can find the artwork later without the disc.
+        [ -n "$release_group" ] && \
+            tags[${#tags[@]}]="--tag=MUSICBRAINZ_RELEASEGROUPID=$release_group"
 
         # --verify decodes as it encodes and fails loudly on a bad read, which
         # is the closest thing to rip verification available without cdparanoia.
@@ -352,16 +380,14 @@ for num, title, name in entries:
     # Navidrome reads cover.jpg from the album folder; embedding it as well
     # keeps the artwork with the files if they ever move.
     if [ "$FETCH_COVER_ART" = "1" ] && [ -n "$mbid" ] && [ "$ripped" -gt 0 ]; then
-        local flac_file
-        if fetch_cover_art "$mbid" "$dest_dir"; then
+        if fetch_cover_art "$mbid" "$release_group" "$dest_dir"; then
+            embed_cover_art "$dest_dir"
             log "   🖼  cover.jpg"
-            for flac_file in "$dest_dir"/*.flac; do
-                [ -f "$flac_file" ] || continue
-                metaflac --remove --block-type=PICTURE --dont-use-padding \
-                    "$flac_file" </dev/null 2>/dev/null
-                metaflac --import-picture-from="3||||$dest_dir/cover.jpg" \
-                    "$flac_file" </dev/null 2>/dev/null
-            done
+        else
+            # Say so rather than finishing silently: the tracks are fine, but
+            # the album will look bare in Navidrome until art is backfilled.
+            log "   ⚠️  No cover art available for this release"
+            log "      retry later with: $0 --art \"$dest_dir\""
         fi
     fi
 
@@ -377,11 +403,75 @@ for num, title, name in entries:
     [ "$failed" -eq 0 ] && [ "$ripped" -gt 0 ]
 }
 
+# Backfill cover art into an already-ripped album folder, no disc required.
+# Reads the MusicBrainz IDs back out of the FLAC tags, so this works whenever
+# the art fetch failed at rip time (Cover Art Archive outage, or a release that
+# had no cover of its own).
+backfill_art() {
+    local dest_dir="$1" first mbid rgid
+    if [ ! -d "$dest_dir" ]; then
+        log "❌ Not a directory: $dest_dir"
+        return 1
+    fi
+
+    first=""
+    for first in "$dest_dir"/*.flac; do
+        [ -f "$first" ] && break
+    done
+    if [ ! -f "$first" ]; then
+        log "❌ No FLAC files in $dest_dir"
+        return 1
+    fi
+
+    mbid="$(metaflac --show-tag=MUSICBRAINZ_ALBUMID "$first" 2>/dev/null | cut -d= -f2-)"
+    rgid="$(metaflac --show-tag=MUSICBRAINZ_RELEASEGROUPID "$first" 2>/dev/null | cut -d= -f2-)"
+
+    if [ -z "$mbid" ] && [ -z "$rgid" ]; then
+        log "❌ No MusicBrainz IDs in the tags; cannot look up art for $dest_dir"
+        return 1
+    fi
+
+    # Older rips predate the release-group tag, so resolve it on the fly.
+    if [ -z "$rgid" ] && [ -n "$mbid" ]; then
+        log "   🔍 Resolving release group for $mbid..."
+        rgid="$(python3 "$SCRIPT_DIR/mb_lookup.py" --release-group "$mbid" 2>/dev/null)"
+    fi
+
+    log "   🔍 Fetching art (release ${mbid:-none}, group ${rgid:-none})..."
+    rm -f "$dest_dir/cover.jpg"
+    if fetch_cover_art "$mbid" "$rgid" "$dest_dir"; then
+        embed_cover_art "$dest_dir"
+        log "   🖼  cover.jpg written and embedded in $(basename "$dest_dir")"
+        return 0
+    fi
+    log "   ❌ Still no cover art available for $(basename "$dest_dir")"
+    return 1
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 for tool in python3 flac metaflac curl; do
     type -p "$tool" >/dev/null || { log "❌ $tool is required but not installed"; exit 1; }
 done
+
+# --art [dir]: backfill artwork instead of watching for discs. With no
+# directory, sweeps every album in the library that is missing cover.jpg.
+if [ "${1:-}" = "--art" ]; then
+    if [ -n "${2:-}" ]; then
+        backfill_art "$2"
+        exit $?
+    fi
+    log "🖼  Backfilling cover art for albums missing cover.jpg..."
+    missing=0; fixed=0
+    while IFS= read -r album_dir <&3; do
+        [ -f "$album_dir/cover.jpg" ] && continue
+        missing=$((missing + 1))
+        log "📂 $album_dir"
+        backfill_art "$album_dir" && fixed=$((fixed + 1))
+    done 3< <(find "$NAVIDROME_ROOT" -type d -depth 2 2>/dev/null | sort)
+    log "📊 $fixed of $missing albums fixed"
+    exit 0
+fi
 
 mkdir -p "$NAVIDROME_ROOT" || { log "❌ Cannot write to $NAVIDROME_ROOT"; exit 1; }
 
