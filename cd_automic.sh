@@ -480,16 +480,37 @@ log "   Library: $NAVIDROME_ROOT"
 
 # Volumes we have already handled this session, so a disc that fails to eject
 # doesn't get re-ripped every five seconds.
-handled=""
+handled_vols=()
+
+# Note the ${arr[@]+"${arr[@]}"} guard throughout: under `set -u`, bash 3.2
+# treats an empty array expansion as an unbound variable.
+is_handled() {
+    local v
+    for v in ${handled_vols[@]+"${handled_vols[@]}"}; do
+        [ "$v" = "$1" ] && return 0
+    done
+    return 1
+}
+
+# Forget volumes that have gone away, whichever way they went — auto-ejected,
+# ejected by hand, or the drive unplugged. Without this a disc that didn't eject
+# cleanly would be ignored for the rest of the session if you re-inserted it.
+prune_handled() {
+    local kept=() v
+    for v in ${handled_vols[@]+"${handled_vols[@]}"}; do
+        [ -d "$v" ] && kept[${#kept[@]}]="$v"
+    done
+    handled_vols=(${kept[@]+"${kept[@]}"})
+}
 
 while true; do
+    prune_handled
+
     while read -r vol_path <&3; do
         [ -d "$vol_path" ] || continue
         [ "$vol_path" = "/Volumes" ] && continue
 
-        case "$handled" in
-            *"|$vol_path|"*) continue ;;
-        esac
+        is_handled "$vol_path" && continue
 
         aiff_dir=""
         file_count="$(count_aiff "$vol_path")"
@@ -505,7 +526,7 @@ while true; do
         fi
         [ -n "$aiff_dir" ] || continue
 
-        handled="$handled|$vol_path|"
+        handled_vols[${#handled_vols[@]}]="$vol_path"
 
         if process_disc "$vol_path" "$aiff_dir" "$file_count"; then
             if [ "$EJECT_WHEN_DONE" = "1" ]; then
@@ -517,12 +538,7 @@ while true; do
             log "   ⚠️  Leaving disc mounted so you can retry"
         fi
 
-        # Forget ejected volumes so the same disc can be re-inserted later.
-        if [ ! -d "$vol_path" ]; then
-            handled="${handled//|$vol_path|/}"
-        fi
-
-        break  # one disc at a time
+        break  # one disc at a time; prune_handled clears it once it unmounts
     done 3< <(find /Volumes -maxdepth 1 -type d 2>/dev/null)
 
     sleep "$POLL_INTERVAL"
