@@ -1,138 +1,211 @@
 #!/bin/bash
 # macOS Auto CD Ripper for Navidrome
-# Waits for disc insertion → rips AIFF→FLAC → fetches MusicBrainz metadata 
-# → organizes folders → embeds sidecar metadata → ejects → repeats
+# Auto-tags using MusicBrainz via python musicbrainzngs library.
+# Falls back to volume-name-based metadata if MusicBrainz lookup fails.
 
-set -uo pipefail
+set -euo pipefail
 
-# ⚙️ CONFIGURATION (CHANGE THIS FOR YOUR SYSTEM)
-NAVIDROME_ROOT="./navidrome_music"  # <-- Change to your Navidrome music folder path
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+NAVIDROME_ROOT="./navidrome_music"
+mkdir -p "$NAVIDROME_ROOT" 2>/dev/null || NAVIDROME_ROOT="/private/tmp/navidrome_music"
 
-# Dependencies check
-if ! command -v ffmpeg &>/dev/null; then
-    echo "❌ Error: 'ffmpeg' not found. Run: brew install ffmpeg"
-    exit 1
-fi
-if ! command -v curl &>/dev/null; then
-    echo "❌ Error: 'curl' not found."
-    exit 1
-fi
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-mkdir -p "$NAVIDROME_ROOT" 2>/dev/null || true
-
-echo "🎬 Auto CD Ripper started. Waiting for audio CDs..."
-echo "   (Press Ctrl+C in terminal to stop)\n"
-
-# Graceful cleanup on interrupt
-cleanup() {
-    echo -e "\n⏹️ Stopping watcher..."
-    exit 0
+# Count .aiff files in a directory (strips wc leading whitespace)
+count_aiff() {
+    find "$1" -maxdepth 1 -name "*.aiff" -type f 2>/dev/null | wc -l | tr -d ' '
 }
-trap cleanup INT TERM
+
+# Get track count from .TOC.plist (more reliable than counting .aiff files)
+get_track_count_from_toc() {
+    local toc_file="$1/.TOC.plist"
+    if [ -f "$toc_file" ]; then
+        python3 -c "
+import plistlib
+with open('$toc_file', 'rb') as f:
+    toc = plistlib.load(f)
+tracks = toc['Sessions'][0]['Track Array']
+print(len(tracks))
+" 2>/dev/null || echo "0"
+    else
+        echo "0"
+    fi
+}
+
+# Query MusicBrainz using the mb_lookup.py helper.
+# Outputs JSON to stdout on success, prints error to stderr and exits 1 on failure.
+lookup_musicbrainz() {
+    local toc_dir="$1"
+    local disc_name="$2"
+    local track_count="$3"
+    
+    local toc_file="$toc_dir/.TOC.plist"
+    
+    python3 "$SCRIPT_DIR/mb_lookup.py" \
+        --toc "$toc_file" \
+        --disc-name "$disc_name" \
+        --track-count "$track_count" 2>/dev/null
+}
+
+# Tag a single FLAC file with the given metadata using metaflac.
+tag_flac() {
+    local flac_file="$1"
+    local album="$2"
+    local artist="$3"
+    local track_number="$4"
+    local track_title="$5"
+    local track_total="${6:-}"
+    
+    local tag_data=""
+    tag_data="ALBUM=${album}"
+    tag_data+=$'\n'
+    tag_data+="ARTIST=${artist}"
+    tag_data+=$'\n'
+    tag_data+="TRACKNUMBER=${track_number}"
+    tag_data+=$'\n'
+    tag_data+="TITLE=${track_title}"
+    tag_data+=$'\n'
+    
+    if [ -n "$track_total" ]; then
+        tag_data+=$'\n'
+        tag_data+="TRACKTOTAL=${track_total}"
+    fi
+    
+    metaflac --remove-all-tags --import-tags-from=- "$flac_file" <<< "$tag_data" 2>/dev/null
+}
+
+# ── Main Loop ────────────────────────────────────────────────────────────────
+
+echo "🎬 Auto CD Ripper started! Watching /Volumes..." >&2
+
+# Verify dependencies
+type -p python3 >/dev/null || { echo "❌ Python3 required but not found" >&2; exit 1; }
+type -p metaflac >/dev/null || { echo "❌ metaflac required but not found" >&2; exit 1; }
+type -p ffmpeg >/dev/null || { echo "❌ ffmpeg required but not found" >&2; exit 1; }
 
 while true; do
-    # Clean up any previous temp files just in case
-    rm -rf /tmp/cd_ripper_* 2>/dev/null
-    
-    TEMP_DIR=$(mktemp -d /tmp/cd_ripper_XXXXXX)
-    mkdir -p "$TEMP_DIR/rwa" "$TEMP_DIR/flac"
-    
-    # 1️⃣ Wait for CD insertion (scans mounted volumes for .aiff files)
-    DISC_PATH=""
-    while IFS= read -r vol; do
-        if [[ -d "$vol" ]] && find "$vol" -maxdepth 2 -name "*.aiff" | head -n 1 &>/dev/null; then
-            DISC_PATH="$vol"
-            break
+    while read -r vol_path; do
+        [ -d "$vol_path" ] || continue
+        
+        DISC_NAME=$(basename "$vol_path")
+        AIFF_DIR=""
+        
+        # Check if it's an Audio CD by looking for .aiff files
+        file_count=$(count_aiff "$vol_path")
+        
+        if [[ $file_count -gt 0 ]]; then
+            AIFF_DIR="$vol_path"
+            echo "📀 Found Audio CD at root: $DISC_NAME" >&2
+        elif [ -d "$vol_path/CD_AUDIO" ]; then
+            file_count=$(count_aiff "$vol_path/CD_AUDIO")
+            if [[ $file_count -gt 0 ]]; then
+                AIFF_DIR="$vol_path/CD_AUDIO"
+                echo "📀 Found Audio CD in folder: $DISC_NAME/CD_AUDIO" >&2
+            fi
+        else
+            continue
         fi
+        
+        [ -z "$AIFF_DIR" ] && continue
+        
+        # ── Metadata Resolution ──────────────────────────────────────────────
+        ARTIST="Unknown Artist"
+        ALBUM=$(echo "$DISC_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g')
+        ARTIST_SAFE=$(echo "$ARTIST" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g')
+        MB_TITLE=""
+        MB_DATE=""
+        
+        # Get track count from .TOC.plist (more reliable)
+        toc_track_count=$(get_track_count_from_toc "$AIFF_DIR")
+        [ "$toc_track_count" -eq 0 ] && toc_track_count=$file_count
+        
+        # Try MusicBrainz lookup
+        if [[ $file_count -gt 0 ]]; then
+            echo "   🔍 Looking up '$DISC_NAME' ($file_count tracks) on MusicBrainz..." >&2
+            mb_json=$(lookup_musicbrainz "$AIFF_DIR" "$DISC_NAME" "$toc_track_count" 2>/dev/null) || true
+            
+            if [ -n "$mb_json" ]; then
+                ARTIST=$(echo "$mb_json" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('artist','Unknown Artist'))")
+                MB_TITLE=$(echo "$mb_json" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('title',''))")
+                MB_DATE=$(echo "$mb_json" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('date',''))")
+                ALBUM=$(echo "$MB_TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g')
+                ARTIST_SAFE=$(echo "$ARTIST" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g')
+                echo "   ✅ Found: $ARTIST - $MB_TITLE ($MB_DATE)" >&2
+            else
+                echo "   ⚠️  MusicBrainz lookup failed, using volume name as album" >&2
+            fi
+        fi
+        
+        # ── Rip & Convert ────────────────────────────────────────────────────
+        DEST_DIR="$NAVIDROME_ROOT/$ARTIST_SAFE/$ALBUM"
+        mkdir -p "$DEST_DIR"
+        
+        # Build track listing from MB JSON if available
+        track_listing=""
+        if [ -n "$mb_json" ] && [ -n "$MB_TITLE" ]; then
+            track_listing=$(echo "$mb_json" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for t in d.get('tracks', []):
+    print(f\"{t['position']}\t{t['title']}\")
+" 2>/dev/null) || true
+        fi
+        
+        # Collect .aiff files sorted naturally (1, 2, ..., 10, 11 ...)
+        tmp_filelist=$(mktemp)
+        find "$AIFF_DIR" -maxdepth 1 -name "*.aiff" -type f -print0 | \
+            xargs -0 -I{} basename {} | \
+            sort -V > "$tmp_filelist"
+        
+        track_num=0
+        while IFS= read -r aiff_base; do
+            track_num=$((track_num + 1))
+            RAW_NAME="${aiff_base%.aiff}"
+            SAFE_NAME=$(echo "$RAW_NAME" | tr '[:space:]' '_' | sed 's/__/_/g')
+            
+            OUT_FILE="$DEST_DIR/${SAFE_NAME}.flac"
+            
+            # Determine track title from MusicBrainz or fallback
+            if [ -n "$track_listing" ]; then
+                TRACK_TITLE=$(echo "$track_listing" | awk -F'\t' -v n="$track_num" '$1 == n {print $2}')
+                [ -z "$TRACK_TITLE" ] && TRACK_TITLE="Unknown Track $track_num"
+            else
+                TRACK_TITLE="Track $track_num"
+            fi
+            
+            # Progress indicator
+            echo "   [${track_num}/${toc_track_count}] Rip: $TRACK_TITLE..." >&2
+            
+            # Rip and convert with ffmpeg (show progress via stderr)
+            if ffmpeg -i "$AIFF_DIR/$aiff_base" \
+                      -c:a flac -compression_level 6 \
+                      -metadata title="$TRACK_TITLE" \
+                      -metadata album="$MB_TITLE" \
+                      -metadata artist="$ARTIST" \
+                      -metadata date="$MB_DATE" \
+                      -metadata comment="CD: $DISC_NAME" \
+                      -y \
+                      "$OUT_FILE" 2>&1 | sed 's/^/      /' >&2; then
+                
+                # Tag with metaflac for proper Vorbis comments (track number, total)
+                if [ -n "$track_listing" ]; then
+                    tag_flac "$OUT_FILE" "$MB_TITLE" "$ARTIST" "$track_num" "$TRACK_TITLE" "$toc_track_count" 2>/dev/null
+                fi
+                
+                echo "   ✅ ${SAFE_NAME}.flac" >&2
+            else
+                echo "   ❌ Failed to rip: $aiff_base" >&2
+            fi
+        done < "$tmp_filelist"
+        
+        rm -f "$tmp_filelist"
+        
+        # Eject
+        echo "   🚗 Ejecting: $DISC_NAME" >&2
+        diskutil eject "$vol_path" >/dev/null 2>&1 &
+        
+        break  # Process one disc at a time
     done < <(find /Volumes -maxdepth 1 -type d 2>/dev/null)
-
-    [[ -z "$DISC_PATH" ]] && { sleep 5; continue; }
-
-    DISC_NAME=$(basename "$DISC_PATH")
     
-    # Find the directory containing .aiff files (can be root or CD_AUDIO subfolder)
-    AIFF_DIR=$(find "$DISC_PATH" -maxdepth 2 -name "*.aiff" -print0 | xargs -0 -I{} dirname {} | sort -u | head -n 1)
-
-    # If still no audio files found (maybe it's not an audio CD), skip
-    if [[ ! "$(ls $AIFF_DIR/*.aiff 2>/dev/null)" ]]; then
-        echo "⚠️  Volume found at $DISC_PATH but no audio (.aiff) tracks detected. Skipping..."
-        sleep 10 
-        rm -rf "$TEMP_DIR"
-        continue
-    fi
-
-    echo "\n📀 Disc inserted: $DISC_NAME"
-
-    # 2️⃣ Extract DiscID via MusicBrainz (if available command exists)
-    DISCID="unknown_manual"
-    if command -v musicbrainz-discid &>/dev/null; then
-        DISCID=$(musicbrainz-discid "$AIFF_DIR" | grep "^Disc-ID:" | awk '{print $3}')
-    fi
-    
-    # If that fails, we'll just use "Manual_Rip_Date" as ID to prevent duplicates in Navidrome logic
-    [[ -z "$DISCID" ]] && DISCID="mac_$(date +%Y%m%d%H%M)"
-
-    # 3️⃣ Fetch exact-match metadata from MusicBrainz CD Stub API
-    ARTIST="Unknown Artist"
-    ALBUM="Unknown Album"
-    
-    # Normalize disc ID for URL (lowercase, replace chars if needed usually handled by api)
-    MB_URL=$(curl -sL --max-time 5 "https://musicbrainz.org/cdstub/api/musicbrainz-discid_$(echo $DISCID | tr '[:upper:]' '[:lower:]')?fmt=json" 2>/dev/null || echo "")
-    
-    # Actually, the simpler stub API often expects a hash or specific lookup. 
-    # Let's use MusicBrainz DiscID Lookup service if possible, but the Stub API is standard for bash scripts.
-    # Fallback to a robust URL pattern:
-    MB_JSON=$(curl -sL --max-time 10 "https://musicbrainz.org/cdstub/api/$DISCID?fmt=json" 2>/dev/null || echo "")
-
-    if [[ -n "$MB_JSON" ]] && ! echo "$MB_JSON" | grep -q '"error"'; then
-        ARTIST=$(echo "$MB_JSON" | jq -r '.artist // "Unknown Artist"')
-        ALBUM=$(echo "$MB_JSON" | jq -r '(if .title then .title else (if .alttitle then .alttitle else "Unknown Album" end) end)')
-    fi
-
-    # Sanitize for file paths (lowercase + underscores instead of spaces/special chars)
-    ARTIST_SAFE=$(echo "$ARTIST" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g')
-    ALBUM_SAFE=$(echo "$ALBUM"   | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g')
-
-    DEST_DIR="$NAVIDROME_ROOT/$ARTIST_SAFE/$ALBUM_SAFE"
-    mkdir -p "$DEST_DIR"
-
-    echo "🏷️  Tagging: $ARTIST / $ALBUM"
-    echo "   📁 Target: $DEST_DIR/"
-
-    # 4️⃣ Rip & Convert (macOS AIFF → FLAC with embedded tags)
-    TRACK_NUM=0
-    for aiff in $(ls -v "$AIFF_DIR"/*.aiff 2>/dev/null); do
-        [[ ! -f "$aiff" ]] && continue
-
-        # Grab track title from MB if available, else default
-        # Note: jq syntax for array index requires valid JSON input. The stub json has a 'tracks' array.
-        TRACK_TITLE=$(echo "$MB_JSON" | jq -r ".tracks[$TRACK_NUM].title // \"Track $((TRACK_NUM+1))\"" 2>/dev/null || echo "Track $((TRACK_NUM+1))")
-
-        OUT_FILE="$DEST_DIR/$(printf '%02d' $((TRACK_NUM+1)))_$TRACK_TITLE.flac"
-
-        # Lossless conversion + explicit metadata embedding
-        ffmpeg -i "$aiff" \
-               -c:a flac -compression_level 6 \
-               -map_metadata 0 \
-               -metadata album="$ALBUM" \
-               -metadata artist="$ARTIST" \
-               -metadata title="$TRACK_TITLE" \
-               -metadata "DISCID=$DISCID" \
-               "$OUT_FILE" 2>/dev/null
-
-        # Create the sidecar metadata file (.cue) automatically as requested
-        CUE_OUT=$(echo "$OUT_FILE" | sed 's/.flac$//').cue
-        gencue "$aiff" > "$CUE_OUT" 2>/dev/null || echo "Note: Could auto-generate .cue sidecar for this track (missing 'gencue')"
-
-        echo "   ✅ $((TRACK_NUM+1)). $(echo "$TRACK_TITLE" | cut -c1-35).flac"
-        ((TRACK_NUM++))
-    done
-
-    # 5️⃣ Eject & Clean up for next disc
-    echo "\n🚗 Ejected: $DISC_NAME"
-    diskutil eject "$DISC_PATH" >/dev/null 2>&1 || true
-    
-    rm -rf "$TEMP_DIR"
-    
-    echo "📦 Ready for next disc...\n"
+    sleep 5
 done
