@@ -379,10 +379,22 @@ for num, title, name in entries:
     # ── Cover art ────────────────────────────────────────────────────────────
     # Navidrome reads cover.jpg from the album folder; embedding it as well
     # keeps the artwork with the files if they ever move.
-    if [ "$FETCH_COVER_ART" = "1" ] && [ -n "$mbid" ] && [ "$ripped" -gt 0 ]; then
-        if fetch_cover_art "$mbid" "$release_group" "$dest_dir"; then
+    #
+    # This runs on every pass, not only on fresh rips, so re-inserting a disc
+    # whose tracks are all present but whose art is missing backfills it — the
+    # same work as `--art`, without needing a separate invocation.
+    if [ "$FETCH_COVER_ART" = "1" ] && [ "$ripped" -gt 0 ]; then
+        if [ -f "$dest_dir/cover.jpg" ]; then
+            # Already have the art; make sure it is embedded in every track,
+            # including any track added by this pass.
+            embed_cover_art "$dest_dir"
+        elif [ -n "$mbid" ] && fetch_cover_art "$mbid" "$release_group" "$dest_dir"; then
             embed_cover_art "$dest_dir"
             log "   🖼  cover.jpg"
+        elif backfill_art "$dest_dir" >/dev/null 2>&1; then
+            # This disc's lookup came up empty, but MusicBrainz IDs already in
+            # the tags from an earlier rip may still resolve.
+            log "   🖼  cover.jpg (from existing tags)"
         else
             # Say so rather than finishing silently: the tracks are fine, but
             # the album will look bare in Navidrome until art is backfilled.

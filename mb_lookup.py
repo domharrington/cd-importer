@@ -33,11 +33,34 @@ import base64
 import hashlib
 import json
 import plistlib
+import re
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+# macOS labels the volume "Audio CD" whenever the Music app has not cached a
+# metadata lookup for the disc, so the name carries no album information. A
+# title search on it returns confident nonsense — querying for a 12-track
+# release named "Audio CD" matches "Best of Super Audio CD" by Various Artists
+# — so the title fallback is skipped for names like these.
+GENERIC_DISC_NAMES = {
+    "audio cd", "audio", "cd", "cdda", "untitled", "untitled cd", "unknown",
+    "unknown album", "unknown artist", "no name", "blank cd", "new volume",
+    "disc", "disk",
+}
+
+
+def is_generic_disc_name(name):
+    """True if a volume name is a placeholder rather than an album title."""
+    cleaned = (name or "").strip().lower()
+    # Treat separators alike, so "audio_cd" and "audio-cd" match "audio cd"...
+    cleaned = re.sub(r"[\s_-]+", " ", cleaned)
+    # ...and drop the counter macOS appends when discs share a name ("Audio CD 2").
+    cleaned = re.sub(r"\s*\d+$", "", cleaned).strip()
+    return not cleaned or cleaned in GENERIC_DISC_NAMES
+
 
 WS = "https://musicbrainz.org/ws/2"
 CONTACT = "hello@domharrington.email"
@@ -387,10 +410,16 @@ def main():
         attempts.append(("disc ID " + discid, lambda: lookup_by_discid(discid, args.track_count)))
     if toc:
         attempts.append(("fuzzy TOC match", lambda: lookup_by_toc(toc, args.track_count)))
-    if args.disc_name:
+    if args.disc_name and not is_generic_disc_name(args.disc_name):
         attempts.append(
             (f"title search '{args.disc_name}'",
              lambda: lookup_by_title(args.disc_name, args.track_count))
+        )
+    elif args.disc_name:
+        print(
+            f"skipping title search: '{args.disc_name}' is a placeholder volume "
+            "name, not an album title",
+            file=sys.stderr,
         )
 
     for label, attempt in attempts:
