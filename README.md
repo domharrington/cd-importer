@@ -88,6 +88,9 @@ All optional, set as environment variables:
 | `SHOW_ENCODE_PROGRESS` | `1` | Tick a live elapsed-time line per track (interactive terminals only) |
 | `RIP_UNIDENTIFIED` | `0` | Rip discs MusicBrainz doesn't know anyway, into `_unidentified/` |
 | `UNIDENTIFIED_LOG` | `./unidentified-discs.log` | Where unidentified discs are recorded |
+| `FORCE_ARTIST` | — | Supply the artist yourself; implies "rip this disc" |
+| `FORCE_ALBUM` | — | Supply the album yourself; implies "rip this disc" |
+| `FORCE_DATE` | — | Release date; otherwise taken from the album's release group |
 
 ```sh
 NAVIDROME_ROOT=/Volumes/Music EJECT_WHEN_DONE=0 ./cd_automic.sh
@@ -151,6 +154,27 @@ everyone else. Re-insert it afterwards and it files itself normally. Set
 or one that may not survive a second read; it then lands in
 `_unidentified/<disc id>/` with a `DISC-INFO.txt`, alongside a `.ndignore` so
 Navidrome skips the folder.
+
+**Discs MusicBrainz will never have.** Unofficial pressings — an album padded
+out with extra tracks, on a label that never released it — are real discs that no
+amount of waiting will add to MusicBrainz. Supply the metadata yourself:
+
+```sh
+FORCE_ARTIST="David Gray" FORCE_ALBUM="White Ladder" ./cd_automic.sh
+```
+
+Either variable implies "rip this disc", so `RIP_UNIDENTIFIED` is not needed, and
+the result is filed in the library proper — the identity came from you, not from a
+guess. Track titles still come from the filenames, so it is worth letting the Music
+app name the disc first if it can.
+
+The album name is then looked up in MusicBrainz on its own. The *pressing* may be
+unknown there while the album is not, and that album's release group supplies both
+a release date (so the folder gets its `(year)`) and a cover from the Cover Art
+Archive. Set `FORCE_DATE` to override the date — the release group gives the
+album's original date, which is not necessarily this pressing's. To keep the
+sleeve art rather than the official cover, drop your own `cover.jpg` into the album
+folder; an existing one is never overwritten.
 
 **The Music app is not involved.** macOS labels the volume `Audio CD` and names
 every file `N Audio Track.aiff` until the Music app's own (Gracenote) lookup

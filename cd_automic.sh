@@ -28,6 +28,16 @@ WATCH_ROOT="${WATCH_ROOT:-/Volumes}"
 # or one that may not read a second time.
 RIP_UNIDENTIFIED="${RIP_UNIDENTIFIED:-0}"
 UNIDENTIFIED_LOG="${UNIDENTIFIED_LOG:-$SCRIPT_DIR/unidentified-discs.log}"
+
+# Supply the metadata yourself for a disc MusicBrainz does not have — an
+# unofficial pressing, say. Setting either one also implies "rip this disc": the
+# identity came from you rather than from a guess, so it is filed in the library
+# proper instead of being quarantined.
+FORCE_ARTIST="${FORCE_ARTIST:-}"
+FORCE_ALBUM="${FORCE_ALBUM:-}"
+# Release date, "YYYY" or "YYYY-MM-DD". Left unset, the album is looked up by
+# name in MusicBrainz and that release group's first-release date is used.
+FORCE_DATE="${FORCE_DATE:-}"
 EJECT_WHEN_DONE="${EJECT_WHEN_DONE:-1}"
 FETCH_COVER_ART="${FETCH_COVER_ART:-1}"
 # 1 = tick a live elapsed-time line while each track encodes (interactive only);
@@ -36,6 +46,25 @@ SHOW_ENCODE_PROGRESS="${SHOW_ENCODE_PROGRESS:-1}"
 USER_AGENT="cd-importer/1.0 ( hello@domharrington.email )"
 
 log() { echo "$@" >&2; }
+
+# The encoder runs in the background so its progress can be ticked, which means
+# an interrupt would otherwise leave it orphaned — still reading the disc, and
+# then fighting the next run for the drive at ~1/80th of normal throughput.
+CURRENT_FLAC_PID=""
+CURRENT_FLAC_OUT=""
+on_interrupt() {
+    if [ -n "$CURRENT_FLAC_PID" ] && kill -0 "$CURRENT_FLAC_PID" 2>/dev/null; then
+        log ""
+        log "   ⏹  Interrupted; stopping encoder $CURRENT_FLAC_PID"
+        kill "$CURRENT_FLAC_PID" 2>/dev/null
+        wait "$CURRENT_FLAC_PID" 2>/dev/null
+        # A half-written track would fail verification on the next pass anyway,
+        # but leaving it behind invites confusion.
+        [ -n "$CURRENT_FLAC_OUT" ] && rm -f "$CURRENT_FLAC_OUT"
+    fi
+    exit 130
+}
+trap on_interrupt INT TERM HUP
 
 # CD audio is 44100Hz x 16-bit x 2ch = 176400 bytes per second, so an .aiff's
 # size gives its playing time without having to probe the file.
@@ -250,7 +279,7 @@ process_disc() {
         fallback_discid="$(printf '%s\n' "$discid_out" | grep -v '^toc=' | head -1)"
         fallback_toc="$(printf '%s\n' "$discid_out" | sed -n 's/^toc=//p')"
 
-        if [ "$RIP_UNIDENTIFIED" != "1" ]; then
+        if [ "$RIP_UNIDENTIFIED" != "1" ] && [ -z "$FORCE_ALBUM" ] && [ -z "$FORCE_ARTIST" ]; then
             # Record what makes this disc fixable later, so nothing is lost by
             # not ripping it: the disc ID, the TOC, and a link that submits both.
             {
@@ -288,6 +317,41 @@ process_disc() {
     [ -n "$album_artist" ] || album_artist="$artist"
     case "$disc_number" in ''|*[!0-9]*) disc_number=1 ;; esac
     case "$disc_total" in ''|*[!0-9]*) disc_total=1 ;; esac
+
+    # Caller-supplied metadata overrides anything looked up, and counts as an
+    # identification — no disc-ID suffix on the album, no quarantine folder.
+    if [ -n "$FORCE_ARTIST" ] || [ -n "$FORCE_ALBUM" ]; then
+        if [ -n "$FORCE_ARTIST" ]; then
+            artist="$FORCE_ARTIST"
+            album_artist="$FORCE_ARTIST"
+        fi
+        [ -n "$FORCE_ALBUM" ] && album="$FORCE_ALBUM"
+        identified=1
+        log "   ✏️  Using supplied metadata: $album_artist - $album"
+
+        # This pressing is unknown to MusicBrainz, but the album almost always
+        # exists there as a release group — which carries a first-release date
+        # and, in the Cover Art Archive, a cover. Neither needs this exact disc.
+        if [ -z "$release_group" ] || [ -z "$date" ]; then
+            local rg_json
+            rg_json="$(python3 "$SCRIPT_DIR/mb_lookup.py" \
+                --find-album "$album_artist" "$album" 2>/dev/null)"
+            if [ -n "$rg_json" ]; then
+                [ -z "$release_group" ] && release_group="$(mb_field release_group "$rg_json")"
+                [ -z "$date" ] && date="$(mb_field date "$rg_json")"
+                [ -z "$year" ] && year="$(mb_field year "$rg_json")"
+                log "      album found in MusicBrainz: released $date"
+            else
+                log "      album not found by name; no date or cover art"
+            fi
+        fi
+
+        # An explicitly supplied date beats the release group's.
+        if [ -n "$FORCE_DATE" ]; then
+            date="$FORCE_DATE"
+            year="$(printf '%s' "$FORCE_DATE" | cut -c1-4)"
+        fi
+    fi
 
     # ── Destination ──────────────────────────────────────────────────────────
     local artist_dir album_dir dest_dir
@@ -455,15 +519,31 @@ for num, title, name in entries:
             # Encode in the background so we can tick a single, self-overwriting
             # progress line. Only when stderr is a terminal — writing \r into a
             # redirected log would just produce very long lines.
-            local pid
+            local pid watchdog
             "${flac_cmd[@]}" </dev/null &
             pid=$!
+            CURRENT_FLAC_PID="$pid"
+            CURRENT_FLAC_OUT="$out_file"
+
+            # A background child of a non-interactive shell inherits SIGINT as
+            # ignored (POSIX), so Ctrl-C never reaches the encoder on its own —
+            # that is how an orphan survived and then fought the next run for the
+            # drive at 1/80th throughput. The trap covers catchable signals; this
+            # watchdog covers SIGKILL, which no handler can intercept. It outlives
+            # the parent deliberately.
+            ( while kill -0 $$ 2>/dev/null; do sleep 2; done
+              kill "$pid" 2>/dev/null ) &
+            watchdog=$!
             while kill -0 "$pid" 2>/dev/null; do
                 printf '\r      ⏳ %s' "$(fmt_elapsed $(( $(date +%s) - track_start )))" >&2
                 sleep 1
             done
             wait "$pid"
             status=$?
+            kill "$watchdog" 2>/dev/null
+            wait "$watchdog" 2>/dev/null
+            CURRENT_FLAC_PID=""
+            CURRENT_FLAC_OUT=""
             printf '\r\033[K' >&2
         else
             "${flac_cmd[@]}" </dev/null
@@ -498,7 +578,8 @@ for num, title, name in entries:
             # Already have the art; make sure it is embedded in every track,
             # including any track added by this pass.
             embed_cover_art "$dest_dir"
-        elif [ -n "$mbid" ] && fetch_cover_art "$mbid" "$release_group" "$dest_dir"; then
+        elif { [ -n "$mbid" ] || [ -n "$release_group" ]; } \
+             && fetch_cover_art "$mbid" "$release_group" "$dest_dir"; then
             embed_cover_art "$dest_dir"
             log "   🖼  cover.jpg"
         elif backfill_art "$dest_dir" >/dev/null 2>&1; then

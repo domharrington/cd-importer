@@ -281,6 +281,45 @@ def lookup_by_discid(discid, track_count):
     return pick(data.get("releases", []), discid, track_count, "discid")
 
 
+def find_album_by_name(artist, album):
+    """Resolve an artist + album name to a release group.
+
+    For a pressing MusicBrainz does not have — an unofficial one, say — the album
+    itself usually still exists. The release group gives a first-release date and
+    a cover in the Cover Art Archive, neither of which needs this exact disc.
+    """
+    query = f'releasegroup:"{album}"'
+    if artist:
+        query += f' AND artist:"{artist}"'
+    try:
+        data = ws_get("release-group", {"query": query, "limit": "10"})
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError,
+            json.JSONDecodeError):
+        return None
+
+    groups = data.get("release-groups", [])
+    if not groups:
+        return None
+
+    def rank(group):
+        # Prefer an exact title match, then a plain Album over a compilation or
+        # live record, then whatever MusicBrainz scored highest.
+        exact = (group.get("title") or "").strip().lower() != (album or "").strip().lower()
+        primary = (group.get("primary-type") or "") != "Album"
+        secondary = bool(group.get("secondary-types"))
+        return (exact, primary, secondary, -int(group.get("score") or 0))
+
+    best = sorted(groups, key=rank)[0]
+    date = best.get("first-release-date") or ""
+    return {
+        "release_group": best.get("id", ""),
+        "title": best.get("title", ""),
+        "artist": credit_to_name(best.get("artist-credit")),
+        "date": date,
+        "year": date[:4],
+    }
+
+
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 def main():
@@ -294,11 +333,28 @@ def main():
         help="Print the computed disc ID and exit (no network access)",
     )
     parser.add_argument(
+        "--find-album",
+        nargs=2,
+        metavar=("ARTIST", "ALBUM"),
+        help="Resolve an artist and album name to a release group and date (JSON)",
+    )
+    parser.add_argument(
         "--release-group",
         metavar="RELEASE_MBID",
         help="Print the release-group MBID for a release MBID and exit",
     )
     args = parser.parse_args()
+
+    if args.find_album:
+        result = find_album_by_name(args.find_album[0], args.find_album[1])
+        if not result:
+            print("no release group found for that artist/album", file=sys.stderr)
+            return 1
+        print(f"  matched release group: {result['artist']} - {result['title']} "
+              f"({result['year']})", file=sys.stderr)
+        json.dump(result, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 0
 
     if args.release_group:
         try:
