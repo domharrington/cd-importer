@@ -86,7 +86,8 @@ All optional, set as environment variables:
 | `EJECT_WHEN_DONE` | `1` | Eject after a fully successful rip |
 | `FETCH_COVER_ART` | `1` | Pull front cover from the Cover Art Archive |
 | `SHOW_ENCODE_PROGRESS` | `1` | Tick a live elapsed-time line per track (interactive terminals only) |
-| `RIP_UNIDENTIFIED` | `1` | Still rip discs MusicBrainz doesn't know, into `_unidentified/` |
+| `RIP_UNIDENTIFIED` | `0` | Rip discs MusicBrainz doesn't know anyway, into `_unidentified/` |
+| `UNIDENTIFIED_LOG` | `./unidentified-discs.log` | Where unidentified discs are recorded |
 
 ```sh
 NAVIDROME_ROOT=/Volumes/Music EJECT_WHEN_DONE=0 ./cd_automic.sh
@@ -131,11 +132,25 @@ releases: a 2-track TOC matched an unrelated CD single, and 14-track TOCs matche
 *The Platters – Golden Greats* and a Jacques Dutronc album. Neither is used.
 A mistagged album hides in a library; a quarantined one doesn't.
 
-Discs MusicBrainz cannot identify are still ripped — that's the slow part, and
-the disc is in the drive now — but into `_unidentified/<disc id>/` alongside a
-`DISC-INFO.txt` containing a link that submits the TOC to MusicBrainz. Adding it
-there fixes every future rip of the same pressing. Set `RIP_UNIDENTIFIED=0` to
-skip them instead.
+Discs MusicBrainz cannot identify are **not** ripped. Such a rip carries no
+usable metadata — `Unknown Artist`, tracks called `Track 1`…`Track N` — and the
+fix produces a properly tagged copy anyway, so the untagged one is only cleanup
+waiting to happen. Instead the disc is appended to `unidentified-discs.log` with
+its disc ID and a link that submits its TOC to MusicBrainz, then ejected so a
+bulk session keeps moving:
+
+```
+2026-08-18 10:35  Audio CD  (11 tracks)
+  disc id: jlHtxFX.aqP87gEkUTuygZF0BJ8-
+  submit:  https://musicbrainz.org/cdtoc/attach?toc=1+11+139760+150+...&tracks=11&id=jlHtxFX...
+```
+
+Adding the disc there fixes every future rip of that pressing, for you and
+everyone else. Re-insert it afterwards and it files itself normally. Set
+`RIP_UNIDENTIFIED=1` when the audio matters more than the tags — a borrowed disc,
+or one that may not survive a second read; it then lands in
+`_unidentified/<disc id>/` with a `DISC-INFO.txt`, alongside a `.ndignore` so
+Navidrome skips the folder.
 
 **The Music app is not involved.** macOS labels the volume `Audio CD` and names
 every file `N Audio Track.aiff` until the Music app's own (Gracenote) lookup
