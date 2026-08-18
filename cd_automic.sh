@@ -513,42 +513,44 @@ for num, title, name in entries:
         flac_cmd=(flac --best --verify --totally-silent --force
                   "${tags[@]}" -o "$out_file" "$aiff_dir/$aiff_base")
 
-        local track_start track_elapsed out_bytes status
+        local track_start track_elapsed out_bytes status pid watchdog
         track_start="$(date +%s)"
-        if [ "$SHOW_ENCODE_PROGRESS" = "1" ] && [ -t 2 ]; then
-            # Encode in the background so we can tick a single, self-overwriting
-            # progress line. Only when stderr is a terminal — writing \r into a
-            # redirected log would just produce very long lines.
-            local pid watchdog
-            "${flac_cmd[@]}" </dev/null &
-            pid=$!
-            CURRENT_FLAC_PID="$pid"
-            CURRENT_FLAC_OUT="$out_file"
 
-            # A background child of a non-interactive shell inherits SIGINT as
-            # ignored (POSIX), so Ctrl-C never reaches the encoder on its own —
-            # that is how an orphan survived and then fought the next run for the
-            # drive at 1/80th throughput. The trap covers catchable signals; this
-            # watchdog covers SIGKILL, which no handler can intercept. It outlives
-            # the parent deliberately.
-            ( while kill -0 $$ 2>/dev/null; do sleep 2; done
-              kill "$pid" 2>/dev/null ) &
-            watchdog=$!
+        # Always background the encoder and record its PID, whether or not we
+        # tick progress. Running it in the foreground on the non-interactive path
+        # left nothing for the interrupt handler to reap: the encoder survived and
+        # its half-written track stayed on disk.
+        "${flac_cmd[@]}" </dev/null &
+        pid=$!
+        CURRENT_FLAC_PID="$pid"
+        CURRENT_FLAC_OUT="$out_file"
+
+        # A background child of a non-interactive shell inherits SIGINT as
+        # ignored (POSIX), so Ctrl-C never reaches the encoder by itself — that is
+        # how an orphan once survived and fought the next run for the drive at
+        # 1/80th throughput. The trap covers catchable signals; this watchdog
+        # covers SIGKILL, which no handler can intercept, and deliberately
+        # outlives the parent.
+        ( while kill -0 $$ 2>/dev/null; do sleep 2; done
+          kill "$pid" 2>/dev/null ) &
+        watchdog=$!
+
+        # Tick a self-overwriting elapsed-time line, but only for a terminal —
+        # \r into a redirected log would just make very long lines.
+        if [ "$SHOW_ENCODE_PROGRESS" = "1" ] && [ -t 2 ]; then
             while kill -0 "$pid" 2>/dev/null; do
                 printf '\r      ⏳ %s' "$(fmt_elapsed $(( $(date +%s) - track_start )))" >&2
                 sleep 1
             done
-            wait "$pid"
-            status=$?
-            kill "$watchdog" 2>/dev/null
-            wait "$watchdog" 2>/dev/null
-            CURRENT_FLAC_PID=""
-            CURRENT_FLAC_OUT=""
             printf '\r\033[K' >&2
-        else
-            "${flac_cmd[@]}" </dev/null
-            status=$?
         fi
+
+        wait "$pid"
+        status=$?
+        kill "$watchdog" 2>/dev/null
+        wait "$watchdog" 2>/dev/null
+        CURRENT_FLAC_PID=""
+        CURRENT_FLAC_OUT=""
 
         if [ "$status" -eq 0 ]; then
             track_elapsed=$(( $(date +%s) - track_start ))
