@@ -34,6 +34,7 @@ import base64
 import hashlib
 import json
 import plistlib
+import re
 import sys
 import time
 import urllib.error
@@ -300,6 +301,18 @@ def find_album_by_name(artist, album):
     groups = data.get("release-groups", [])
     if not groups:
         return None
+
+    # MusicBrainz matches artist names loosely, so a search for Texas also
+    # returns Little Texas. Attaching the wrong artist's date and cover art is
+    # worse than attaching none, so require the credit to match.
+    if artist:
+        def norm(name):
+            return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+
+        wanted = norm(artist)
+        groups = [g for g in groups if norm(credit_to_name(g.get("artist-credit"))) == wanted]
+        if not groups:
+            return None
 
     def rank(group):
         # Prefer an exact title match, then a plain Album over a compilation or
