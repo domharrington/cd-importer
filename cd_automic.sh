@@ -758,6 +758,20 @@ while true; do
             log "   ⚠️  Leaving disc mounted so you can retry"
         fi
 
+        # Supplied metadata describes ONE disc. Carrying on would silently apply
+        # it to whatever is inserted next, so stop after this disc rather than
+        # mislabelling the next one.
+        if [ -n "$FORCE_ARTIST" ] || [ -n "$FORCE_ALBUM" ]; then
+            if [ "$disc_status" = "0" ] || [ "$disc_status" = "2" ]; then
+                log "   👋 Done. Exiting: the metadata you supplied applies to this"
+                log "      disc only, and would otherwise be used for the next one."
+                exit 0
+            fi
+            log "   👋 Exiting after a failed disc: supplied metadata applies to"
+            log "      this disc only. Re-run the same command to retry."
+            exit 1
+        fi
+
         break  # one disc at a time; prune_handled clears it once it unmounts
     done 3< <(find "$WATCH_ROOT" -maxdepth 1 -type d 2>/dev/null)
 

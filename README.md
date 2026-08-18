@@ -163,6 +163,10 @@ amount of waiting will add to MusicBrainz. Supply the metadata yourself:
 FORCE_ARTIST="David Gray" FORCE_ALBUM="White Ladder" ./cd_automic.sh
 ```
 
+Because that metadata describes one specific disc, the script **exits after that
+disc** instead of continuing to watch — otherwise the next CD you inserted would
+be filed under the same artist and album.
+
 Either variable implies "rip this disc", so `RIP_UNIDENTIFIED` is not needed, and
 the result is filed in the library proper — the identity came from you, not from a
 guess. Track titles still come from the filenames, so it is worth letting the Music
