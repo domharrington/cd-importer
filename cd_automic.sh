@@ -104,6 +104,24 @@ relocate_volume() {
     return 1
 }
 
+# If the disc's files are no longer where we last saw them, find where the volume
+# went and adopt the new path. Updates the caller's aiff_dir and vol_path.
+follow_volume_if_moved() {
+    local moved
+    if [ -f "$aiff_dir/.TOC.plist" ] && [ "$(count_aiff "$aiff_dir")" -gt 0 ]; then
+        return 0
+    fi
+    moved="$(relocate_volume "$disc_id")" || return 1
+    [ -n "$moved" ] || return 1
+    log "   ↪  Volume renamed; following it to $(basename "$moved")"
+    aiff_dir="$moved"
+    vol_path="$moved"
+    # Claim the new mount point so the watch loop does not treat the same disc
+    # as freshly inserted once this pass finishes.
+    handled_vols[${#handled_vols[@]}]="$moved"
+    return 0
+}
+
 count_aiff() {
     find "$1" -maxdepth 1 -name "*.aiff" -type f 2>/dev/null | wc -l | tr -d ' '
 }
@@ -303,6 +321,10 @@ process_disc() {
     # ── Build a numerically sorted "track number <TAB> filename" work list ───
     # Track numbers come from the leading digits macOS puts in each filename,
     # so a missing or unreadable track can't silently shift everything after it.
+    # Music renames the volume as its own metadata lookup lands, which can fall
+    # between detecting the disc and listing its tracks. Re-resolve first.
+    follow_volume_if_moved || true
+
     local work_list
     work_list="$(mktemp)" || return 1
     find "$aiff_dir" -maxdepth 1 -name "*.aiff" -type f -print0 2>/dev/null \
@@ -377,20 +399,10 @@ for num, title, name in entries:
         out_file="$dest_dir/$out_name.flac"
 
         # Recover if the volume was renamed since the last track.
-        if [ ! -f "$aiff_dir/$aiff_base" ]; then
-            local moved
-            if moved="$(relocate_volume "$disc_id")" && [ -n "$moved" ]; then
-                log "   ↪  Volume renamed mid-rip; following it to $moved"
-                aiff_dir="$moved"
-                vol_path="$moved"
-                # Claim the new mount point too, so the watch loop does not
-                # treat the same disc as freshly inserted once this pass ends.
-                handled_vols[${#handled_vols[@]}]="$moved"
-            else
-                log "   ❌ Volume vanished mid-rip and could not be relocated"
-                failed=$((failed + 1))
-                continue
-            fi
+        if [ ! -f "$aiff_dir/$aiff_base" ] && ! follow_volume_if_moved; then
+            log "   ❌ Volume vanished mid-rip and could not be relocated"
+            failed=$((failed + 1))
+            continue
         fi
 
         local track_audio
