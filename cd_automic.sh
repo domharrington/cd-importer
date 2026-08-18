@@ -27,6 +27,11 @@ WATCH_ROOT="${WATCH_ROOT:-/Volumes}"
 # moving. Set to 1 when the audio matters more than the tags — a borrowed disc,
 # or one that may not read a second time.
 RIP_UNIDENTIFIED="${RIP_UNIDENTIFIED:-0}"
+# Give up on a disc after this many consecutive read failures. A drive that is
+# failing repeatedly tends to wedge entirely — its reads end up stuck in
+# uninterruptible I/O, which even SIGKILL cannot clear — so pressing on through
+# the remaining tracks makes things worse rather than salvaging anything.
+CONSECUTIVE_FAILURE_LIMIT="${CONSECUTIVE_FAILURE_LIMIT:-2}"
 UNIDENTIFIED_LOG="${UNIDENTIFIED_LOG:-$SCRIPT_DIR/unidentified-discs.log}"
 
 # Supply the metadata yourself for a disc MusicBrainz does not have — an
@@ -433,7 +438,7 @@ for num, title, name in entries:
     fi
 
     # ── Encode ───────────────────────────────────────────────────────────────
-    local ripped=0 failed=0 skipped=0
+    local ripped=0 failed=0 skipped=0 consecutive=0
     local album_start audio_total=0 bytes_total=0 audio_done=0
     album_start="$(date +%s)"
 
@@ -565,11 +570,19 @@ for num, title, name in entries:
             audio_done=$((audio_done + track_audio))
             bytes_total=$((bytes_total + out_bytes))
             ripped=$((ripped + 1))
+            consecutive=0
             log "      ✅ $(fmt_elapsed "$track_elapsed") @ $(fmt_speed "$track_audio" "$track_elapsed"), $(fmt_mb "$out_bytes") — $(fmt_mmss "$audio_done")/$(fmt_mmss "$audio_total") of album"
         else
             log "      ❌ Failed: $aiff_base"
             rm -f "$out_file"
             failed=$((failed + 1))
+            consecutive=$((consecutive + 1))
+            if [ "$consecutive" -ge "$CONSECUTIVE_FAILURE_LIMIT" ]; then
+                log "   ⛔ $consecutive failures in a row — abandoning this disc"
+                log "      Tracks already ripped are kept; a re-run resumes here."
+                log "      If this repeats after cleaning the disc, try another drive."
+                break
+            fi
         fi
     done 4< "$work_list"
 
