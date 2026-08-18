@@ -17,6 +17,14 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NAVIDROME_ROOT="${NAVIDROME_ROOT:-$SCRIPT_DIR/navidrome_music}"
 POLL_INTERVAL="${POLL_INTERVAL:-5}"
+# Where to look for mounted discs. Overridable mainly so the unidentified-disc
+# path can be exercised against a synthetic volume.
+WATCH_ROOT="${WATCH_ROOT:-/Volumes}"
+# Still rip a disc MusicBrainz cannot identify? It lands in _unidentified/<disc
+# id>/ with a DISC-INFO.txt rather than in the library proper. Ripping is the
+# slow physical step, so capturing the audio now and tagging later is usually
+# preferable to handling the disc twice. Set to 0 to skip such discs entirely.
+RIP_UNIDENTIFIED="${RIP_UNIDENTIFIED:-1}"
 EJECT_WHEN_DONE="${EJECT_WHEN_DONE:-1}"
 FETCH_COVER_ART="${FETCH_COVER_ART:-1}"
 # 1 = tick a live elapsed-time line while each track encodes (interactive only);
@@ -72,6 +80,25 @@ sanitize() {
         | sed -e 's/[[:space:]][[:space:]]*/ /g' \
               -e 's/^[[:space:].]*//' \
               -e 's/[[:space:].]*$//'
+}
+
+# The Music app renames a volume when its own metadata lookup lands, which moves
+# the mount point — observed going from "/Volumes/Audio CD" to "/Volumes/Eyes
+# Open" on the same /dev/disk4 twenty-four seconds after mount, i.e. mid-rip.
+# The disc ID is computed from the TOC and is stable across the rename, so it can
+# be used to find where the disc went.
+relocate_volume() {
+    local want="$1" v got
+    [ -n "$want" ] || return 1
+    for v in "$WATCH_ROOT"/*/; do
+        [ -f "$v/.TOC.plist" ] || continue
+        got="$(python3 "$SCRIPT_DIR/mb_lookup.py" --toc "$v/.TOC.plist" --print-discid 2>/dev/null)"
+        if [ "$got" = "$want" ]; then
+            printf '%s' "${v%/}"
+            return 0
+        fi
+    done
+    return 1
 }
 
 count_aiff() {
@@ -171,7 +198,6 @@ process_disc() {
     mb_out="$(mktemp)" || return 1
     python3 "$SCRIPT_DIR/mb_lookup.py" \
         --toc "$aiff_dir/.TOC.plist" \
-        --disc-name "$disc_name" \
         --track-count "$track_total" \
         >"$mb_out" 2> >(sed 's/^/      /' >&2) </dev/null
     mb_json="$(cat "$mb_out")"
@@ -179,6 +205,7 @@ process_disc() {
 
     local artist album album_artist date year mbid release_group
     local disc_number disc_total
+    local identified=0 fallback_discid="" fallback_toc="" disc_id=""
     if [ -n "$mb_json" ]; then
         artist="$(mb_field artist "$mb_json")"
         album_artist="$(mb_field album_artist "$mb_json")"
@@ -187,14 +214,40 @@ process_disc() {
         year="$(mb_field year "$mb_json")"
         mbid="$(mb_field mbid "$mb_json")"
         release_group="$(mb_field release_group "$mb_json")"
+        disc_id="$(mb_field discid "$mb_json")"
         disc_number="$(mb_field disc_number "$mb_json")"
         disc_total="$(mb_field disc_total "$mb_json")"
         log "   ✅ $artist - $album ($year)"
+        identified=1
     else
-        log "   ⚠️  MusicBrainz lookup failed; falling back to disc and file names"
+        log "   ⚠️  MusicBrainz has no match for this disc"
+        # The disc ID needs no network, so it is still available as an identity
+        # even when the lookup found nothing.
+        local discid_out
+        discid_out="$(python3 "$SCRIPT_DIR/mb_lookup.py" \
+            --toc "$aiff_dir/.TOC.plist" --print-discid 2>&1)"
+        fallback_discid="$(printf '%s\n' "$discid_out" | grep -v '^toc=' | head -1)"
+        fallback_toc="$(printf '%s\n' "$discid_out" | sed -n 's/^toc=//p')"
+
+        if [ "$RIP_UNIDENTIFIED" != "1" ]; then
+            log "      skipping this disc (RIP_UNIDENTIFIED=0)"
+            return 1
+        fi
+
         artist="Unknown Artist"
         album_artist="Unknown Artist"
-        album="$disc_name"
+        # Qualify the album with the disc ID. Without it every unidentified disc
+        # is tagged ALBUM="Audio CD" by ALBUMARTIST="Unknown Artist", so
+        # Navidrome merges unrelated discs into one album — and on disk they all
+        # land in the same folder as "01 - Track 1.flac", where the next disc
+        # looks already-ripped, gets skipped, and its audio is never captured.
+        if [ -n "$fallback_discid" ]; then
+            album="$disc_name [${fallback_discid:0:8}]"
+            disc_id="$fallback_discid"
+            log "      filed under disc ID $fallback_discid"
+        else
+            album="$disc_name"
+        fi
         date=""; year=""; mbid=""; release_group=""
         disc_number=1; disc_total=1
     fi
@@ -212,7 +265,14 @@ process_disc() {
     if [ "$disc_total" -gt 1 ]; then
         album_dir="$album_dir/Disc $disc_number"
     fi
-    dest_dir="$NAVIDROME_ROOT/$artist_dir/$album_dir"
+    if [ "$identified" = "1" ]; then
+        dest_dir="$NAVIDROME_ROOT/$artist_dir/$album_dir"
+    else
+        # Quarantine rather than pollute the library with "Unknown Artist"
+        # albums. The audio is the expensive part, so it is still captured —
+        # move the folder into place once it has been tagged.
+        dest_dir="$NAVIDROME_ROOT/_unidentified/${fallback_discid:-$album_dir}"
+    fi
     mkdir -p "$dest_dir" || { log "   ❌ Cannot create $dest_dir"; return 1; }
     log "   📂 $dest_dir"
 
@@ -294,6 +354,23 @@ for num, title, name in entries:
         local out_name out_file
         out_name="$(printf '%02d - %s' "$track_num" "$(sanitize "$title")")"
         out_file="$dest_dir/$out_name.flac"
+
+        # Recover if the volume was renamed since the last track.
+        if [ ! -f "$aiff_dir/$aiff_base" ]; then
+            local moved
+            if moved="$(relocate_volume "$disc_id")" && [ -n "$moved" ]; then
+                log "   ↪  Volume renamed mid-rip; following it to $moved"
+                aiff_dir="$moved"
+                vol_path="$moved"
+                # Claim the new mount point too, so the watch loop does not
+                # treat the same disc as freshly inserted once this pass ends.
+                handled_vols[${#handled_vols[@]}]="$moved"
+            else
+                log "   ❌ Volume vanished mid-rip and could not be relocated"
+                failed=$((failed + 1))
+                continue
+            fi
+        fi
 
         local track_audio
         track_audio="$(file_duration "$aiff_dir/$aiff_base")"
@@ -403,6 +480,21 @@ for num, title, name in entries:
         fi
     fi
 
+    # ── Unidentified discs: leave behind what is needed to fix them later ────
+    if [ "$identified" != "1" ] && [ "$ripped" -gt 0 ] && [ -n "$fallback_toc" ]; then
+        {
+            echo "Volume name: $disc_name"
+            echo "Disc ID:     ${fallback_discid:-unknown}"
+            echo "Tracks:      $track_total"
+            echo "TOC:         $fallback_toc"
+            echo
+            echo "This disc is not in MusicBrainz. Add it (which fixes every"
+            echo "future rip of the same pressing) at:"
+            echo "https://musicbrainz.org/cdtoc/attach?toc=$fallback_toc&tracks=$track_total&id=${fallback_discid:-}"
+        } > "$dest_dir/DISC-INFO.txt" 2>/dev/null
+        log "   📝 DISC-INFO.txt written with the MusicBrainz submission link"
+    fi
+
     # ── Album summary ────────────────────────────────────────────────────────
     local album_elapsed summary
     album_elapsed=$(( $(date +%s) - album_start ))
@@ -487,7 +579,7 @@ fi
 
 mkdir -p "$NAVIDROME_ROOT" || { log "❌ Cannot write to $NAVIDROME_ROOT"; exit 1; }
 
-log "🎬 Auto CD Ripper started — watching /Volumes"
+log "🎬 Auto CD Ripper started — watching $WATCH_ROOT"
 log "   Library: $NAVIDROME_ROOT"
 
 # Volumes we have already handled this session, so a disc that fails to eject
@@ -520,7 +612,7 @@ while true; do
 
     while read -r vol_path <&3; do
         [ -d "$vol_path" ] || continue
-        [ "$vol_path" = "/Volumes" ] && continue
+        [ "$vol_path" = "$WATCH_ROOT" ] && continue
 
         is_handled "$vol_path" && continue
 
@@ -551,7 +643,7 @@ while true; do
         fi
 
         break  # one disc at a time; prune_handled clears it once it unmounts
-    done 3< <(find /Volumes -maxdepth 1 -type d 2>/dev/null)
+    done 3< <(find "$WATCH_ROOT" -maxdepth 1 -type d 2>/dev/null)
 
     sleep "$POLL_INTERVAL"
 done

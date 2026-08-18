@@ -6,9 +6,10 @@ Reads a macOS Audio CD .TOC.plist, computes the MusicBrainz disc ID, and
 resolves it to a release.
 
 Usage:
-    mb_lookup.py --toc <toc.plist> [--disc-name <volume_name>] [--track-count N]
+    mb_lookup.py --toc <toc.plist> [--track-count N]
     mb_lookup.py --toc <toc.plist> --print-discid
     mb_lookup.py --discid <discid>
+    mb_lookup.py --release-group <release_mbid>
 
 Output (JSON to stdout):
 {
@@ -33,34 +34,11 @@ import base64
 import hashlib
 import json
 import plistlib
-import re
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-
-# macOS labels the volume "Audio CD" whenever the Music app has not cached a
-# metadata lookup for the disc, so the name carries no album information. A
-# title search on it returns confident nonsense — querying for a 12-track
-# release named "Audio CD" matches "Best of Super Audio CD" by Various Artists
-# — so the title fallback is skipped for names like these.
-GENERIC_DISC_NAMES = {
-    "audio cd", "audio", "cd", "cdda", "untitled", "untitled cd", "unknown",
-    "unknown album", "unknown artist", "no name", "blank cd", "new volume",
-    "disc", "disk",
-}
-
-
-def is_generic_disc_name(name):
-    """True if a volume name is a placeholder rather than an album title."""
-    cleaned = (name or "").strip().lower()
-    # Treat separators alike, so "audio_cd" and "audio-cd" match "audio cd"...
-    cleaned = re.sub(r"[\s_-]+", " ", cleaned)
-    # ...and drop the counter macOS appends when discs share a name ("Audio CD 2").
-    cleaned = re.sub(r"\s*\d+$", "", cleaned).strip()
-    return not cleaned or cleaned in GENERIC_DISC_NAMES
-
 
 WS = "https://musicbrainz.org/ws/2"
 CONTACT = "hello@domharrington.email"
@@ -69,7 +47,6 @@ USER_AGENT = f"cd-importer/1.0 ( {CONTACT} )"
 # libdiscid convention: on an enhanced CD the audio lead-out is taken to be
 # the data track's start block minus this many sectors.
 DATA_TRACK_GAP = 11400
-
 
 # ── Disc ID ──────────────────────────────────────────────────────────────────
 
@@ -304,58 +281,11 @@ def lookup_by_discid(discid, track_count):
     return pick(data.get("releases", []), discid, track_count, "discid")
 
 
-def lookup_by_toc(toc, track_count):
-    """Fuzzy TOC match: finds releases whose disc layout is close enough even
-    when this exact pressing has no disc ID attached yet."""
-    try:
-        data = ws_get(
-            "discid/-", {"toc": toc, "inc": "artist-credits+recordings+release-groups", "cdstubs": "no"}
-        )
-    except urllib.error.HTTPError as err:
-        if err.code == 404:
-            return None
-        raise
-    return pick(data.get("releases", []), None, track_count, "toc")
-
-
-def release_group_for(release_mbid):
-    """Resolve a release MBID to its release-group MBID.
-
-    Used by the --art backfill path for albums ripped before the release group
-    was recorded in the tags.
-    """
-    data = ws_get(f"release/{release_mbid}", {"inc": "release-groups"})
-    return (data.get("release-group") or {}).get("id", "")
-
-
-def lookup_by_title(album_name, track_count):
-    query = f'release:"{album_name}"'
-    if track_count:
-        query += f" AND tracks:{track_count}"
-    try:
-        data = ws_get("release", {"query": query, "limit": "10"})
-    except urllib.error.HTTPError:
-        return None
-
-    for candidate in data.get("releases", []):
-        try:
-            full = ws_get(
-                f"release/{candidate['id']}", {"inc": "artist-credits+recordings+release-groups"}
-            )
-        except urllib.error.HTTPError:
-            continue
-        result = build_result(full, None, track_count, "title")
-        if result and (not track_count or len(result["tracks"]) == track_count):
-            return result
-    return None
-
-
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="MusicBrainz lookup helper")
     parser.add_argument("--toc", help="Path to .TOC.plist")
-    parser.add_argument("--disc-name", help="Volume name, for the title-search fallback")
     parser.add_argument("--discid", help="Pre-computed disc ID")
     parser.add_argument("--track-count", type=int, default=0)
     parser.add_argument(
@@ -405,21 +335,15 @@ def main():
             print(f"toc={toc}", file=sys.stderr)
         return 0
 
+    # Disc ID only. It is a hash of the disc's own table of contents, so a match
+    # is exact and a miss is honest. Both fuzzy alternatives MusicBrainz offers
+    # (its "?toc=" similarity search, and a title search on the volume name) were
+    # tested and returned confidently wrong releases, which is worse than no
+    # match at all: a quarantined disc is obvious, a mistagged one is not.
     attempts = []
     if discid:
-        attempts.append(("disc ID " + discid, lambda: lookup_by_discid(discid, args.track_count)))
-    if toc:
-        attempts.append(("fuzzy TOC match", lambda: lookup_by_toc(toc, args.track_count)))
-    if args.disc_name and not is_generic_disc_name(args.disc_name):
         attempts.append(
-            (f"title search '{args.disc_name}'",
-             lambda: lookup_by_title(args.disc_name, args.track_count))
-        )
-    elif args.disc_name:
-        print(
-            f"skipping title search: '{args.disc_name}' is a placeholder volume "
-            "name, not an album title",
-            file=sys.stderr,
+            ("disc ID " + discid, lambda: lookup_by_discid(discid, args.track_count))
         )
 
     for label, attempt in attempts:
