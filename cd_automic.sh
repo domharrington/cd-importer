@@ -20,11 +20,14 @@ POLL_INTERVAL="${POLL_INTERVAL:-5}"
 # Where to look for mounted discs. Overridable mainly so the unidentified-disc
 # path can be exercised against a synthetic volume.
 WATCH_ROOT="${WATCH_ROOT:-/Volumes}"
-# Still rip a disc MusicBrainz cannot identify? It lands in _unidentified/<disc
-# id>/ with a DISC-INFO.txt rather than in the library proper. Ripping is the
-# slow physical step, so capturing the audio now and tagging later is usually
-# preferable to handling the disc twice. Set to 0 to skip such discs entirely.
-RIP_UNIDENTIFIED="${RIP_UNIDENTIFIED:-1}"
+# Rip discs MusicBrainz cannot identify? Off by default: such a rip carries no
+# usable metadata, and the fix (submit the disc's TOC, re-insert) produces a
+# properly tagged copy anyway, so the untagged one only creates cleanup. The disc
+# is instead recorded in UNIDENTIFIED_LOG and ejected, keeping a bulk session
+# moving. Set to 1 when the audio matters more than the tags — a borrowed disc,
+# or one that may not read a second time.
+RIP_UNIDENTIFIED="${RIP_UNIDENTIFIED:-0}"
+UNIDENTIFIED_LOG="${UNIDENTIFIED_LOG:-$SCRIPT_DIR/unidentified-discs.log}"
 EJECT_WHEN_DONE="${EJECT_WHEN_DONE:-1}"
 FETCH_COVER_ART="${FETCH_COVER_ART:-1}"
 # 1 = tick a live elapsed-time line while each track encodes (interactive only);
@@ -230,8 +233,19 @@ process_disc() {
         fallback_toc="$(printf '%s\n' "$discid_out" | sed -n 's/^toc=//p')"
 
         if [ "$RIP_UNIDENTIFIED" != "1" ]; then
-            log "      skipping this disc (RIP_UNIDENTIFIED=0)"
-            return 1
+            # Record what makes this disc fixable later, so nothing is lost by
+            # not ripping it: the disc ID, the TOC, and a link that submits both.
+            {
+                echo "$(date '+%Y-%m-%d %H:%M')  $disc_name  (${track_total} tracks)"
+                echo "  disc id: ${fallback_discid:-unknown}"
+                [ -n "$fallback_toc" ] && echo "  submit:  https://musicbrainz.org/cdtoc/attach?toc=$fallback_toc&tracks=$track_total&id=${fallback_discid:-}"
+                echo
+            } >> "$UNIDENTIFIED_LOG" 2>/dev/null
+            log "      not ripped; logged to $(basename "$UNIDENTIFIED_LOG")"
+            log "      add this disc to MusicBrainz, then re-insert it"
+            # 2 = deliberately not ripped. Distinct from a failure so the disc
+            # still gets ejected and the session keeps moving.
+            return 2
         fi
 
         artist="Unknown Artist"
@@ -274,6 +288,13 @@ process_disc() {
         dest_dir="$NAVIDROME_ROOT/_unidentified/${fallback_discid:-$album_dir}"
     fi
     mkdir -p "$dest_dir" || { log "   ❌ Cannot create $dest_dir"; return 1; }
+
+    # The quarantine sits inside the library root, so Navidrome would otherwise
+    # scan it and show these rips as "Unknown Artist". An empty .ndignore makes
+    # its scanner skip the folder and everything below it.
+    if [ "$identified" != "1" ]; then
+        : > "$NAVIDROME_ROOT/_unidentified/.ndignore" 2>/dev/null
+    fi
     log "   📂 $dest_dir"
 
     local mb_tracks=""
@@ -632,7 +653,9 @@ while true; do
 
         handled_vols[${#handled_vols[@]}]="$vol_path"
 
-        if process_disc "$vol_path" "$aiff_dir" "$file_count"; then
+        process_disc "$vol_path" "$aiff_dir" "$file_count"
+        disc_status=$?
+        if [ "$disc_status" = "0" ] || [ "$disc_status" = "2" ]; then
             if [ "$EJECT_WHEN_DONE" = "1" ]; then
                 log "   🚗 Ejecting $(basename "$vol_path")"
                 diskutil eject "$vol_path" >/dev/null 2>&1 \
