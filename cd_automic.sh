@@ -282,13 +282,20 @@ process_disc() {
         if [ "$RIP_UNIDENTIFIED" != "1" ] && [ -z "$FORCE_ALBUM" ] && [ -z "$FORCE_ARTIST" ]; then
             # Record what makes this disc fixable later, so nothing is lost by
             # not ripping it: the disc ID, the TOC, and a link that submits both.
-            {
-                echo "$(date '+%Y-%m-%d %H:%M')  $disc_name  (${track_total} tracks)"
-                echo "  disc id: ${fallback_discid:-unknown}"
-                [ -n "$fallback_toc" ] && echo "  submit:  https://musicbrainz.org/cdtoc/attach?toc=$fallback_toc&tracks=$track_total&id=${fallback_discid:-}"
-                echo
-            } >> "$UNIDENTIFIED_LOG" 2>/dev/null
-            log "      not ripped; logged to $(basename "$UNIDENTIFIED_LOG")"
+            # Keyed by disc ID so re-inserting the same disc does not keep
+            # appending the same entry.
+            if [ -n "$fallback_discid" ] && [ -f "$UNIDENTIFIED_LOG" ] \
+               && grep -q "disc id: $fallback_discid" "$UNIDENTIFIED_LOG" 2>/dev/null; then
+                log "      already in $(basename "$UNIDENTIFIED_LOG"); not logged again"
+            else
+                {
+                    echo "$(date '+%Y-%m-%d %H:%M')  $disc_name  (${track_total} tracks)"
+                    echo "  disc id: ${fallback_discid:-unknown}"
+                    [ -n "$fallback_toc" ] && echo "  submit:  https://musicbrainz.org/cdtoc/attach?toc=$fallback_toc&tracks=$track_total&id=${fallback_discid:-}"
+                    echo
+                } >> "$UNIDENTIFIED_LOG" 2>/dev/null
+                log "      not ripped; logged to $(basename "$UNIDENTIFIED_LOG")"
+            fi
             log "      add this disc to MusicBrainz, then re-insert it"
             # 2 = deliberately not ripped. Distinct from a failure so the disc
             # still gets ejected and the session keeps moving.
