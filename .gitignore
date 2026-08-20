@@ -1,2 +1,5 @@
 navidrome_music
 unidentified-discs.log
+__pycache__/
+audit-report.md
+tagbackup-*.json
