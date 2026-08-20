@@ -32,6 +32,7 @@ On failure: prints a diagnostic to stderr and exits 1.
 import argparse
 import base64
 import hashlib
+import http.client
 import json
 import plistlib
 import re
@@ -161,7 +162,10 @@ def ws_get(path, params):
                 file=sys.stderr,
             )
             time.sleep(delay)
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as err:
+        # OSError covers URLError, ConnectionError and TimeoutError; HTTPException
+        # covers IncompleteRead and RemoteDisconnected, which MusicBrainz throws
+        # under load and which used to escape this handler entirely.
+        except (OSError, http.client.HTTPException, json.JSONDecodeError) as err:
             if attempt == MAX_ATTEMPTS:
                 raise
             delay = attempt * 2
