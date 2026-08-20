@@ -60,9 +60,13 @@ remote() { ssh $SSH_OPTS "$PI_HOST" "$@"; }
 # Compare artist/album names ignoring case, punctuation and the "(year)" suffix
 # our own folders carry but the existing library's do not.
 normalise() {
+    # A leading "The" is dropped as well: the Pi had this album under
+    # "Fratellis" while our rip filed it under "The Fratellis", so the duplicate
+    # went unnoticed and both a lossy and a FLAC copy ended up in the library.
     printf '%s' "$1" \
         | sed -E 's/[[:space:]]*\([0-9]{4}\)[[:space:]]*$//' \
         | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/^(the|a|an)[[:space:]]+//' \
         | sed -E 's/[^a-z0-9]//g'
 }
 
