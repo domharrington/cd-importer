@@ -33,8 +33,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import localconfig
+
 DEEZER_SEARCH = "https://api.deezer.com/search/artist"
-USER_AGENT = "cd-importer/1.0 ( hello@domharrington.email )"
+USER_AGENT = localconfig.USER_AGENT
 IMAGE_NAME = "artist.jpg"
 MIN_BYTES = 5_000          # anything smaller is an error page
 # Deezer builds artist image URLs from an MD5 of the image. When an artist has no
@@ -213,8 +215,8 @@ def download(url):
 
 def main():
     ap = argparse.ArgumentParser(description="Fetch artist.jpg for each artist folder")
-    ap.add_argument("--host", default="raspberrypi.local")
-    ap.add_argument("--path", default="/srv/shares/media/Music")
+    ap.add_argument("--host", default=localconfig.HOST)
+    ap.add_argument("--path", default=localconfig.MUSIC_PATH)
     ap.add_argument("--apply", action="store_true",
                     help="actually write images (default is a dry run)")
     ap.add_argument("--only", action="append", default=[],

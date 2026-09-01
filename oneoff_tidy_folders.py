@@ -25,8 +25,8 @@ moves, because the two cases need opposite treatment: Låpsley's nested copy is
 byte-identical and redundant, while González's holds a track the top-level copy
 does not.
 
-    ssh raspberrypi.local 'python3 oneoff_tidy_folders.py'            # dry run
-    ssh raspberrypi.local 'python3 oneoff_tidy_folders.py --apply'
+    ssh my-pi 'python3 oneoff_tidy_folders.py'            # dry run
+    ssh my-pi 'python3 oneoff_tidy_folders.py --apply'
 """
 
 import argparse
@@ -35,8 +35,14 @@ import shutil
 import sys
 import unicodedata
 
-MUSIC = "/srv/shares/media/Music"
-SUPERSEDED = "/srv/shares/media/_superseded"
+# Defaults only. These scripts get copied to the music host and run there, so
+# they stay single-file — set MUSIC_PATH/SUPERSEDED_PATH in the environment, or
+# pass the paths as arguments.
+MUSIC_PATH = os.environ.get("MUSIC_PATH", "/srv/music")
+SUPERSEDED_PATH = os.environ.get("SUPERSEDED_PATH", "/srv/_superseded")
+
+MUSIC = MUSIC_PATH
+SUPERSEDED = SUPERSEDED_PATH
 AUDIO = (".mp3", ".m4a", ".mp4", ".flac")
 
 

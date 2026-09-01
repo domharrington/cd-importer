@@ -215,7 +215,7 @@ metadata, no characters that upset Linux or SMB filesystems:
 
 ```sh
 rsync -av --delete --exclude '._*' --exclude '.DS_Store' \
-  navidrome_music/ pi@raspberrypi.local:/path/to/music/
+  navidrome_music/ user@music-server.local:/path/to/music/
 ```
 
 The excludes matter: browsing the folders in Finder sprinkles `.DS_Store` and

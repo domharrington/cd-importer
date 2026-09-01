@@ -9,7 +9,7 @@ José González), so anything measured through it is quietly incomplete.
 Usage:
     ./audit_library.py                      # writes audit-report.md
     ./audit_library.py --out /tmp/audit.md
-    ./audit_library.py --host pi --path /srv/shares/media/Music
+    ./audit_library.py --host my-pi --path /srv/music
 
 The interesting output is the compilation section. Tracks from a various-artists
 compilation are usually tagged with the *track* artist and no ALBUMARTIST, so
@@ -22,6 +22,8 @@ import collections
 import os
 import subprocess
 import sys
+
+import localconfig
 import unicodedata
 
 AUDIO_EXTS = {".mp3", ".m4a", ".mp4", ".flac", ".wma", ".ogg", ".opus", ".wav"}
@@ -268,8 +270,8 @@ def write_report(lib, out_path, host, path):
 
 def main():
     ap = argparse.ArgumentParser(description="Audit the Navidrome library on the Pi")
-    ap.add_argument("--host", default="raspberrypi.local")
-    ap.add_argument("--path", default="/srv/shares/media/Music")
+    ap.add_argument("--host", default=localconfig.HOST)
+    ap.add_argument("--path", default=localconfig.MUSIC_PATH)
     ap.add_argument("--out", default="audit-report.md")
     args = ap.parse_args()
 

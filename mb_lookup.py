@@ -43,8 +43,12 @@ import urllib.parse
 import urllib.request
 
 WS = "https://musicbrainz.org/ws/2"
-CONTACT = "hello@domharrington.email"
-USER_AGENT = f"cd-importer/1.0 ( {CONTACT} )"
+# MusicBrainz requires a contact in the User-Agent and throttles requests
+# without one. Set MB_CONTACT in .env.local; see config.example.env.
+import localconfig
+
+CONTACT = localconfig.CONTACT
+USER_AGENT = localconfig.USER_AGENT
 
 # libdiscid convention: on an enhanced CD the audio lead-out is taken to be
 # the data track's start block minus this many sectors.

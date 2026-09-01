@@ -3,3 +3,6 @@ unidentified-discs.log
 __pycache__/
 audit-report.md
 tagbackup-*.json
+.env.local
+.env
+spoken-artists.txt

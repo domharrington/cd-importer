@@ -15,8 +15,16 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-PI_HOST="${PI_HOST:-raspberrypi.local}"
-PI_PATH="${PI_PATH:-/srv/shares/media/Music}"
+# Load .env.local if present (gitignored) so a real host and paths stay out of
+# this public repo. See config.example.env.
+if [ -f "$SCRIPT_DIR/.env.local" ]; then
+    set -a
+    . "$SCRIPT_DIR/.env.local"
+    set +a
+fi
+
+PI_HOST="${PI_HOST:-${MUSIC_HOST:-music-server.local}}"
+PI_PATH="${PI_PATH:-${MUSIC_PATH:-/srv/music}}"
 LOCAL_ROOT="${LOCAL_ROOT:-$SCRIPT_DIR/navidrome_music}"
 
 # Nothing is written or deleted unless DRY_RUN=0. Deliberately the default: this

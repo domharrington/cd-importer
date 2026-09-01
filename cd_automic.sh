@@ -15,6 +15,15 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Load .env.local if present (gitignored) so a real host and paths stay out of
+# this public repo. See config.example.env.
+if [ -f "$SCRIPT_DIR/.env.local" ]; then
+    set -a
+    . "$SCRIPT_DIR/.env.local"
+    set +a
+fi
+
 NAVIDROME_ROOT="${NAVIDROME_ROOT:-$SCRIPT_DIR/navidrome_music}"
 POLL_INTERVAL="${POLL_INTERVAL:-5}"
 # Where to look for mounted discs. Overridable mainly so the unidentified-disc
@@ -48,7 +57,9 @@ FETCH_COVER_ART="${FETCH_COVER_ART:-1}"
 # 1 = tick a live elapsed-time line while each track encodes (interactive only);
 # 0 = print nothing until the track's summary line.
 SHOW_ENCODE_PROGRESS="${SHOW_ENCODE_PROGRESS:-1}"
-USER_AGENT="cd-importer/1.0 ( hello@domharrington.email )"
+# MusicBrainz and the Cover Art Archive want a contact in the User-Agent. Set
+# MB_CONTACT in .env.local; see config.example.env.
+USER_AGENT="cd-importer/1.0 ( ${MB_CONTACT:-you@example.com} )"
 
 log() { echo "$@" >&2; }
 

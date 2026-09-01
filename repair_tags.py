@@ -20,18 +20,18 @@ touch before touching it, so --restore can put things back.
 
 Run this ON THE PI, where the files are local:
 
-    scp repair_tags.py raspberrypi.local:~/
-    ssh raspberrypi.local 'sudo apt install -y python3-mutagen'
-    ssh -t raspberrypi.local './repair_tags.py dates --list'
-    ssh -t raspberrypi.local './repair_tags.py dates --album "Guitar Legends II" --apply'
-    ssh -t raspberrypi.local './repair_tags.py compilations --list'
+    scp repair_tags.py my-pi:~/
+    ssh my-pi 'sudo apt install -y python3-mutagen'
+    ssh -t my-pi './repair_tags.py dates --list'
+    ssh -t my-pi './repair_tags.py dates --album "Some Compilation" --apply'
+    ssh -t my-pi './repair_tags.py compilations --list'
 
 (apt, not pip: the Pi runs Debian 12, whose Python is "externally managed", so
 plain pip installs are refused. python3-mutagen is packaged at 1.46.0.)
 
 Reversal:
 
-    ssh -t raspberrypi.local './repair_tags.py restore tagbackup-....json'
+    ssh -t my-pi './repair_tags.py restore tagbackup-....json'
 """
 
 import argparse
@@ -600,7 +600,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="Repair tag faults that make Navidrome split or duplicate albums",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--path", default="/srv/shares/media/Music",
+    ap.add_argument("--path", default=os.environ.get("MUSIC_PATH", "/srv/music"),
                     help="library root ON THIS MACHINE (default: the Pi's path)")
     sub = ap.add_subparsers(dest="mode", required=True)
 
