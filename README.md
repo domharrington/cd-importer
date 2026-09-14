@@ -219,36 +219,45 @@ generic music-note icon. The art *is* in the files; players read it fine.
 
 ## Replacing a streaming subscription
 
-The point of ripping CDs is to stop renting the same music every month. These
-two scripts work out what is actually worth buying, rather than guessing.
+The point of ripping CDs is to stop renting the same music every month.
+`spotify_buylist.py` works out what is actually worth buying, rather than
+guessing.
+
+It reads Spotify's **extended streaming history** — request it at
+[spotify.com/account/privacy](https://www.spotify.com/account/privacy/) and it
+arrives by email within about 30 days. That export is every play since the
+account was created, with a millisecond duration on each, so an album can be
+ranked by hours you actually listened rather than by a proxy for it. (The Web
+API was tried first and abandoned: it caps "top tracks" at 50 per time range,
+which is a sample, and it needs an OAuth app to return less useful data.)
 
 ```sh
-./spotify_export.py      # pull your listening data (browser consent, once)
-./spotify_buylist.py     # rank it against what you already own -> buy-list.md
+./spotify_buylist.py --history ~/Downloads/'Spotify Extended Streaming History'
 ```
 
-`spotify_export.py` needs a Spotify app Client ID in `.env.local` — create one at
-[developer.spotify.com/dashboard](https://developer.spotify.com/dashboard) with
-redirect URI `http://127.0.0.1:8888/callback`. There is no client secret: the
-PKCE flow is the right fit for a script with nowhere to keep one.
+Set `SPOTIFY_HISTORY` in `.env.local` to skip the flag. Output is `buy-list.md`:
 
-`spotify_buylist.py` reads the library over SSH and produces two lists:
+- **Buy** — albums you play but do not own at all
+- **Complete** — albums you own only part of, where the disc both fills the gaps
+  and upgrades what you have to lossless
 
-- **Buy** — albums you clearly listen to that are not in the library at all
-- **Complete** — albums you own only part of, where buying the disc both fills
-  the gaps and upgrades what you have to lossless
+Albums score the hours played, discounted on an exponential half-life (3 years
+by default), so something worn out a decade ago ranks below something played
+weekly now without disappearing entirely. The raw hours print alongside the
+weighted score, so a surprising ranking can be checked rather than trusted.
 
-Scores are a sum of visible components (saved album, top-track rank by time
-range, liked-song count, top artist), printed next to each row so a surprising
-ranking can be argued with. Album matching ignores case, punctuation, accents
-and edition suffixes, and falls back to album-name-only matching so a soundtrack
-filed under `Various Artists` is still recognised as owned.
+Album matching folds case, punctuation, accents and edition suffixes, and falls
+back to album-name-only matching so a soundtrack filed under `Various Artists`
+is still recognised as owned. It errs toward merging: a false merge costs an
+album a place in the ranking, whereas a false split recommends buying something
+already on the shelf.
 
-One limitation worth knowing: the Web API caps top tracks at 50 per time range.
-For real lifetime play counts, request the **extended streaming history** at
-[spotify.com/account/privacy](https://www.spotify.com/account/privacy/) — it
-takes up to 30 days to arrive, so ask early. Unpack it into `spotify-data/` and
-`spotify_buylist.py` picks it up automatically.
+Three things in this export will silently produce wrong answers, and the script
+handles all three — see its docstring for detail:
+
+- the `_1.json` files are **not** duplicates of their base year
+- `skipped` is `False` on every record from 2017–2022
+- `ts` is when a track *stopped*, in UTC, and `conn_country` is not constant
 
 ## Syncing to a server
 
