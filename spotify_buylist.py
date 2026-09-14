@@ -56,6 +56,7 @@ import re
 import sys
 import unicodedata
 
+import library_gaps
 import localconfig
 from audit_library import Library, list_remote_files
 
@@ -240,7 +241,8 @@ def classify(albums, exact, by_name, tolerance):
 
 # ── Report ───────────────────────────────────────────────────────────────────
 
-def write_report(buy, complete, have, args, stats, host, path, total_hours, covered):
+def write_report(buy, complete, have, gaps, args, stats, host, path,
+                 total_hours, covered):
     L = []
     w = L.append
     w("# Albums to buy\n")
@@ -256,7 +258,8 @@ def write_report(buy, complete, have, args, stats, host, path, total_hours, cove
     w(f"| total listening | {total_hours:,.0f} hours |")
     w(f"| covered by the library | {100*covered/total_hours:.1f}% |")
     w(f"| albums played but not owned | {len(buy):,} |")
-    w(f"| albums owned but incomplete | {len(complete):,} |")
+    w(f"| albums with confirmed missing tracks | {len(gaps):,} |")
+    w(f"| albums possibly incomplete | {len(complete):,} |")
     w("")
 
     w("## Buy — not in the library\n")
@@ -273,13 +276,47 @@ def write_report(buy, complete, have, args, stats, host, path, total_hours, cove
       "suggests you play one track from it, not the album.\n")
 
     w("## Complete — owned, but missing tracks\n")
-    w("Track totals are not in the export, so the expected length is the number "
-      "of *distinct track titles you have actually played* from that album — "
-      "titles rather than Spotify URIs, since one song across a reissue, a "
-      "remaster and a deluxe edition has three URIs and would otherwise treble "
-      "the apparent album length. Still a lower bound: it cannot see tracks you "
-      "never played.\n")
+    w("Albums already in the library that are missing part of themselves. "
+      "Buying the disc fills the gaps *and* upgrades what is there to lossless, "
+      "so these are often better value than a new album.\n")
+
+    if gaps:
+        w("### Confirmed missing — gaps in the track numbering\n")
+        w("Hard evidence from the tags on disk: an album holding tracks 1, 3 and "
+          "7 is missing four, whatever it was played. Independent of Spotify, so "
+          "an album pruned years ago and never streamed since still appears.\n")
+        w(f"**{len(gaps)} albums.**\n")
+        w("| hrs | have | of | missing | artist — album |")
+        w("|---|---|---|---|---|")
+        for g in gaps:
+            miss = (", ".join(str(n) for n in g["missing"])
+                    if len(g["missing"]) <= 10
+                    else ", ".join(str(n) for n in g["missing"][:10])
+                         + f" +{len(g['missing']) - 10}")
+            disc = f" [disc {g['disc']}]" if g["disc"] != 1 else ""
+            approx = "" if g["exact"] else "~"
+            hrs = f"{g['hours']:.1f}" if g["hours"] else "—"
+            # `have` is distinct track numbers, not files: an album with a
+            # duplicated track has more files than tracks, and counting files
+            # made incomplete albums look complete.
+            dup = (f" +{g['files'] - g['have']} dup"
+                   if g.get("files", g["have"]) > g["have"] else "")
+            w(f"| {hrs} | {g['have']}{dup} | {approx}{g['expected']} | {miss} | "
+              f"{g['artist']} — {g['album']}{disc} |")
+        w("")
+        w("`hrs` is lifetime Spotify listening where the album could be matched; "
+          "`—` means you own it but have not streamed it, which is not a reason "
+          "to skip it. A `~` on the total means the tags carry no track count, "
+          "so the real album may be longer still.\n")
+
     if complete:
+        w("### Possibly incomplete — fewer tracks than you have played\n")
+        w("Weaker evidence, from the streaming history: you have played more "
+          "distinct track titles from this album than the library holds. Titles "
+          "rather than Spotify URIs, since one song across a reissue, a remaster "
+          "and a deluxe edition has three URIs and would otherwise treble the "
+          "apparent album length. A lower bound — it cannot see tracks you never "
+          "played.\n")
         w(f"**{len(complete)}.**\n")
         w("| score | artist — album | have | heard |")
         w("|---|---|---|---|")
@@ -287,7 +324,8 @@ def write_report(buy, complete, have, args, stats, host, path, total_hours, cove
             w(f"| {a.score:.1f} | {a.artist} — {a.name} | {a.owned_tracks} | "
               f"{len(a.tracks)} |")
         w("")
-    else:
+
+    if not gaps and not complete:
         w("None.\n")
 
     w("## Already owned\n")
@@ -314,6 +352,9 @@ def main():
     ap.add_argument("--top", type=int, default=100, help="rows per section")
     ap.add_argument("--half-life", type=float, default=3.0,
                     help="years after which a play counts half (default 3)")
+    ap.add_argument("--no-gaps", action="store_true",
+                    help="skip the on-disk track-number scan (it reads every "
+                         "file's tags on the music host, which takes a minute)")
     ap.add_argument("--tolerance", type=int, default=1,
                     help="tracks an owned album may lack before it counts as "
                          "incomplete (default 1, since editions differ)")
@@ -340,18 +381,38 @@ def main():
     exact, by_name = owned_indexes(lib)
     buy, complete, have = classify(albums, exact, by_name, args.tolerance)
 
+    # Albums missing tracks according to their own track numbering. A separate
+    # question from anything the streaming history can answer: an album pruned
+    # years ago and never played since leaves no trace in the history at all.
+    gaps = []
+    if not args.no_gaps:
+        print("scanning track numbers on the music host...", file=sys.stderr)
+        data = library_gaps.scan(args.host, args.path)
+        for g in data["gaps"]:
+            match = albums.get((norm(g["artist"]), norm(g["album"])))
+            g["hours"] = match.hours if match else 0.0
+            g["score"] = match.score if match else 0.0
+            gaps.append(g)
+        # Ones you actually listen to first, then by how much is missing.
+        gaps.sort(key=lambda g: (-g["score"], -len(g["missing"])))
+        print(f"  {data['albums_examined']} albums examined, "
+              f"{len(gaps)} missing tracks "
+              f"({data['excluded_compilation_tracks']} compilation tracks "
+              f"excluded)", file=sys.stderr)
+
     total_ms = sum(a.ms for a in albums.values())
     covered_ms = sum(a.ms for a in albums.values() if a.owned_tracks)
     total_hours = total_ms / 3_600_000
 
-    write_report(buy, complete, have, args, stats, args.host, args.path,
+    write_report(buy, complete, have, gaps, args, stats, args.host, args.path,
                  total_hours, covered_ms / 3_600_000)
 
     print(f"\nwrote {args.out}", file=sys.stderr)
     print(f"  library covers {100*covered_ms/total_ms:.1f}% of "
           f"{total_hours:,.0f} listening hours", file=sys.stderr)
-    print(f"  {len(buy):,} to buy, {len(complete):,} to complete, "
-          f"{len(have):,} owned", file=sys.stderr)
+    print(f"  {len(buy):,} to buy, {len(gaps):,} with confirmed missing tracks, "
+          f"{len(complete):,} possibly incomplete, {len(have):,} owned",
+          file=sys.stderr)
     if buy:
         top = buy[0]
         print(f"  top pick: {top.artist} — {top.name} "
