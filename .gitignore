@@ -6,3 +6,7 @@ tagbackup-*.json
 .env.local
 .env
 spoken-artists.txt
+spotify-data/
+.spotify-token.json
+buy-list.md
+spotify-report.md
