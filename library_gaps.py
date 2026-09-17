@@ -88,10 +88,12 @@ for dirpath, _, filenames in os.walk(ROOT):
             or (rt.get("cpil") if hasattr(rt, "get") else None)
             or tag(t, "compilation")
         )
+        _, disc_total = number(tag(t, "discnumber"))
         rows.append({
             "album": album,
             "artist": tag(t, "albumartist") or tag(t, "artist"),
             "n": n, "total": total, "disc": disc or 1,
+            "disc_total": disc_total,
             "compilation": compilation,
             "dir": os.path.relpath(dirpath, ROOT),
         })
@@ -141,8 +143,38 @@ for ts in groups.values():
         "exact": bool(total), "dir": ts[0]["dir"],
     })
 
+# Whole missing discs, which the per-track gap check cannot see: a 2xCD set
+# holding only disc 1 has no numbering gap at all, every track it owns is
+# present and correctly numbered. This works for compilations too, since it
+# never looks at per-track artists -- and half-owned compilations were
+# otherwise invisible, being excluded from the gap check entirely.
+disc_sets = collections.defaultdict(lambda: {"discs": set(), "total": 0,
+                                             "tracks": 0, "dir": ""})
+for r in rows:
+    if not r["disc_total"]:
+        continue
+    k = (r["artist"].lower(), r["album"].lower())
+    d = disc_sets[k]
+    d["discs"].add(r["disc"])
+    d["total"] = max(d["total"], r["disc_total"])
+    d["tracks"] += 1
+    d["dir"] = d["dir"] or r["dir"]
+    d["artist"], d["album"] = r["artist"], r["album"]
+
+missing_discs = []
+for k, d in disc_sets.items():
+    if d["total"] > len(d["discs"]):
+        missing_discs.append({
+            "artist": d["artist"], "album": d["album"],
+            "have_discs": sorted(d["discs"]), "disc_total": d["total"],
+            "missing_discs": [n for n in range(1, d["total"] + 1)
+                              if n not in d["discs"]],
+            "tracks": d["tracks"], "dir": d["dir"],
+        })
+
 print(json.dumps({
     "gaps": gaps,
+    "missing_discs": missing_discs,
     "duplicates": dupes,
     "scanned": len(rows),
     "excluded_compilation_tracks": excluded,
@@ -176,6 +208,10 @@ def main():
     ap.add_argument("--path", default=localconfig.MUSIC_PATH)
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--min-missing", type=int, default=1)
+    ap.add_argument("--min-disc-tracks", type=int, default=5,
+                    help="ignore multi-disc releases holding fewer tracks than "
+                         "this (default 5) — a stray compilation track is not a "
+                         "missing disc")
     args = ap.parse_args()
 
     data = scan(args.host, args.path)
@@ -204,6 +240,19 @@ def main():
               f"{g['artist']} — {g['album']}{disc}{flag}")
     print("\n~ = no track total in the tags, so the ceiling is the highest track "
           "held; the real album may be longer.")
+
+    # A single stray track from a 2xCD compilation is not "a missing disc" in any
+    # useful sense -- it is one track that happens to carry a disc total. Only
+    # report releases where enough is held for the rest to be worth buying.
+    md = [m for m in data.get("missing_discs", [])
+          if m["tracks"] >= args.min_disc_tracks]
+    if md:
+        print(f"\n{len(md)} multi-disc release(s) missing a whole disc\n")
+        print(f"{'have':>6}{'of':>4}  {'missing':<12} album")
+        for m in sorted(md, key=lambda m: -len(m["missing_discs"])):
+            print(f"{len(m['have_discs']):>6}{m['disc_total']:>4}  "
+                  f"disc {str(m['missing_discs'])[1:-1]:<7} "
+                  f"{m['artist']} — {m['album']} ({m['tracks']} tracks held)")
     return 0
 
 

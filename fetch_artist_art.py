@@ -148,6 +148,55 @@ class Remote:
         return proc.returncode == 0
 
 
+OVERRIDE_FILE = "artist-overrides.txt"
+
+
+def load_overrides():
+    """Artist folder name -> Deezer artist id, from a gitignored side file.
+
+    Popularity ranking picks the wrong artist whenever a name is shared, and no
+    amount of tuning fixes that from the name alone: Deezer lists four acts
+    called "Sway", and the most-followed one is not necessarily yours. Rather
+    than guess harder, let the answer be stated. Lines are `folder name = id`,
+    `#` comments ignored.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), OVERRIDE_FILE)
+    out = {}
+    if not os.path.isfile(path):
+        return out
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            folder, artist_id = line.split("=", 1)
+            folder, artist_id = folder.strip(), artist_id.strip()
+            if folder and artist_id.isdigit():
+                out[normalise(folder)] = artist_id
+    return out
+
+
+OVERRIDES = load_overrides()
+
+
+def deezer_by_id(artist_id):
+    """Fetch one specific Deezer artist, bypassing search entirely."""
+    url = f"https://api.deezer.com/artist/{artist_id}"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            a = json.load(resp)
+    except (OSError, http.client.HTTPException, json.JSONDecodeError) as err:
+        return None, f"override lookup failed ({err})"
+    if a.get("error"):
+        return None, f"override id rejected by Deezer: {a['error']}"
+    picture = a.get("picture_xl") or a.get("picture_big")
+    if not picture or NO_PICTURE_MD5 in picture:
+        return None, f"override artist {artist_id} has no picture"
+    return {"name": a.get("name"), "url": picture,
+            "fans": a.get("nb_fan") or 0, "pinned": True}, None
+
+
 def deezer_lookup(name):
     """Best Deezer match for an artist name, or None if nothing usable is found.
 
@@ -164,6 +213,10 @@ def deezer_lookup(name):
         checking the bytes will reveal them, since the placeholder is a
         perfectly valid JPEG of the requested size.
     """
+    pinned = OVERRIDES.get(normalise(name))
+    if pinned:
+        return deezer_by_id(pinned)
+
     url = f"{DEEZER_SEARCH}?{urllib.parse.urlencode({'q': name, 'limit': 10})}"
     data = None
     for attempt in range(3):
@@ -222,6 +275,10 @@ def main():
     ap.add_argument("--only", action="append", default=[],
                     help="limit to these artist folders (repeatable)")
     ap.add_argument("--limit", type=int, default=0, help="stop after N artists")
+    ap.add_argument("--replace", action="store_true",
+                    help="also re-fetch artists that already have an image. "
+                         "Needed to correct a wrong one — the default skips any "
+                         "folder with an artist.jpg, so a bad match is sticky.")
     args = ap.parse_args()
 
     remote = Remote(args.host, args.path, args.apply)
@@ -234,8 +291,9 @@ def main():
 
     folders = remote.artist_folders()
     have = remote.existing_images()
+    skip = {normalise(x) for x in SKIP_FOLDERS}
     todo = [f for f in folders
-            if f not in have and normalise(f) not in {normalise(s) for s in SKIP_FOLDERS}]
+            if (args.replace or f not in have) and normalise(f) not in skip]
     if args.only:
         wanted = {normalise(o) for o in args.only}
         todo = [f for f in todo if normalise(f) in wanted]
